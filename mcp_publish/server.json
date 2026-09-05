@@ -1,0 +1,13 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.justuncase1210-del/technocore-archive",
+  "title": "Technocore Archive & Ownership",
+  "description": "Durable archive of technocore-chat rooms past their own eviction window, plus ownership tools.",
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "http://provider.akash-palmito.org:30298/mcp"
+    }
+  ]
+}

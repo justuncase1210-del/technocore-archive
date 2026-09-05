@@ -1,0 +1,9 @@
+identity.key
+mailbox_info.txt
+archive_api.log
+__pycache__/
+archives/
+tclk/node_modules/
+mcp_publish/mcp-publisher
+mcp_publish/mcp-publisher.tar.gz
+*.pyc
