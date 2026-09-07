@@ -214,3 +214,20 @@ via a hand-rolled EIP-712 signature (eth_account encode_typed_data +
 sign_message) -- both settling successfully once the fixes above were
 applied, confirming the fix is in the server's request construction, not
 specific to either signing method.
+
+## Real "get paid" proof: acting as payee on a tclk/1 deal
+
+Working around tclk/1's known payee-authored-offer flaw (finding #1 in the
+flop-labs/tclk PR #58 review -- the acceptor, not the offer author, normally
+mints the hash-lock, which breaks when the offer author is the payee): the
+payee mints the hash-lock itself and conveys it as the accept.statement,
+rather than letting the acceptor mint one nobody can open.
+
+Ran the full cycle for real, both sides self-funded and self-controlled for a
+clean demo: offer (role: payee, asset USDC, rail x402) -> accept (payer) ->
+lock (payer signs an EIP-3009 authorization locally, x402-rail.mjs) -> claim
+(payee reveals the preimage, submits the real settlement) -> reveal (posted
+for the record). Contract 0xc6616a4f5dd3d9798b316cde85a61c953b20c6adb3d3e1dc2e58985475c668fc,
+deal room mb-p-tclk-c6616a4f5dd3d979, real settlement tx
+0x42cf5b2a10833ee539a8e73cebeeaedb66bfe27925b560c16aef45725cc89899 on Base
+mainnet -- 0.01 USDC, publicly verifiable in tclk-offers and the deal room.
