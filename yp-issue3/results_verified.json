@@ -1,0 +1,453 @@
+{
+  "_meta": {
+    "generated": "2026-09-10T20:30:32Z",
+    "kibble": "archives/kibble.jsonl",
+    "tclk_offers": "archives/tclk-offers.jsonl",
+    "verify": true
+  },
+  "part_a_kibble": {
+    "coverage": {
+      "first": 11540,
+      "last": 4304475,
+      "span": 4292936,
+      "captured": 2605127,
+      "gaps": 2373,
+      "missing": 1687809,
+      "coverage_pct": 60.7
+    },
+    "attest_lines": 145324,
+    "verdicts_counted": 120099,
+    "verification": {
+      "unverifiable-no-sig": 24250,
+      "verified": 120099
+    },
+    "distinct_attestors": 1404,
+    "same_job_revisions_collapsed": 5778,
+    "accept_constancy": {
+      "total": 68291,
+      "reused_exact": 31726,
+      "reused_template": 35702,
+      "reused_exact_pct": 46.46,
+      "reused_template_pct": 52.28
+    },
+    "reject_constancy_control": {
+      "total": 46030,
+      "reused_exact": 7110,
+      "reused_template": 7305,
+      "reused_exact_pct": 15.45,
+      "reused_template_pct": 15.87
+    },
+    "cumulative_curve": [
+      {
+        "frac": 0.25,
+        "n_verdicts": 14285,
+        "reused_pct": 34.66
+      },
+      {
+        "frac": 0.5,
+        "n_verdicts": 34348,
+        "reused_pct": 54.44
+      },
+      {
+        "frac": 0.75,
+        "n_verdicts": 51961,
+        "reused_pct": 50.51
+      },
+      {
+        "frac": 1.0,
+        "n_verdicts": 68291,
+        "reused_pct": 46.46
+      }
+    ],
+    "seat_heterogeneity": [
+      {
+        "min_verdicts": 5,
+        "n_seats": 586,
+        "E_p": 0.6181,
+        "E_p_cubed": 0.5041,
+        "s_eff_cuberoot": 0.7959,
+        "E_p_volume_weighted": 0.5947,
+        "deciles": [
+          66,
+          74,
+          56,
+          50,
+          9,
+          7,
+          4,
+          7,
+          37,
+          276
+        ],
+        "table": [
+          {
+            "q": 0.0,
+            "scalar_E_p_cubed": 0.2362,
+            "population_E_of_cube": 0.5041,
+            "understatement_x": 2.13,
+            "population_volume_weighted": 0.4885
+          },
+          {
+            "q": 0.1,
+            "scalar_E_p_cubed": 0.2827,
+            "population_E_of_cube": 0.5157,
+            "understatement_x": 1.82,
+            "population_volume_weighted": 0.4984
+          },
+          {
+            "q": 0.25,
+            "scalar_E_p_cubed": 0.3634,
+            "population_E_of_cube": 0.5418,
+            "understatement_x": 1.49,
+            "population_volume_weighted": 0.5227
+          },
+          {
+            "q": 0.5,
+            "scalar_E_p_cubed": 0.5296,
+            "population_E_of_cube": 0.6212,
+            "understatement_x": 1.17,
+            "population_volume_weighted": 0.6023
+          }
+        ]
+      },
+      {
+        "min_verdicts": 10,
+        "n_seats": 434,
+        "E_p": 0.5865,
+        "E_p_cubed": 0.4506,
+        "s_eff_cuberoot": 0.7667,
+        "E_p_volume_weighted": 0.5938,
+        "deciles": [
+          34,
+          69,
+          54,
+          49,
+          7,
+          3,
+          4,
+          5,
+          21,
+          188
+        ],
+        "table": [
+          {
+            "q": 0.0,
+            "scalar_E_p_cubed": 0.2018,
+            "population_E_of_cube": 0.4506,
+            "understatement_x": 2.23,
+            "population_volume_weighted": 0.4872
+          },
+          {
+            "q": 0.1,
+            "scalar_E_p_cubed": 0.2475,
+            "population_E_of_cube": 0.4641,
+            "understatement_x": 1.88,
+            "population_volume_weighted": 0.4971
+          },
+          {
+            "q": 0.25,
+            "scalar_E_p_cubed": 0.3283,
+            "population_E_of_cube": 0.4943,
+            "understatement_x": 1.51,
+            "population_volume_weighted": 0.5215
+          },
+          {
+            "q": 0.5,
+            "scalar_E_p_cubed": 0.4992,
+            "population_E_of_cube": 0.5845,
+            "understatement_x": 1.17,
+            "population_volume_weighted": 0.6013
+          }
+        ]
+      },
+      {
+        "min_verdicts": 20,
+        "n_seats": 333,
+        "E_p": 0.5472,
+        "E_p_cubed": 0.4049,
+        "s_eff_cuberoot": 0.7398,
+        "E_p_volume_weighted": 0.5922,
+        "deciles": [
+          27,
+          61,
+          42,
+          48,
+          6,
+          1,
+          3,
+          2,
+          11,
+          132
+        ],
+        "table": [
+          {
+            "q": 0.0,
+            "scalar_E_p_cubed": 0.1638,
+            "population_E_of_cube": 0.4049,
+            "understatement_x": 2.47,
+            "population_volume_weighted": 0.4857
+          },
+          {
+            "q": 0.1,
+            "scalar_E_p_cubed": 0.208,
+            "population_E_of_cube": 0.4185,
+            "understatement_x": 2.01,
+            "population_volume_weighted": 0.4956
+          },
+          {
+            "q": 0.25,
+            "scalar_E_p_cubed": 0.288,
+            "population_E_of_cube": 0.4501,
+            "understatement_x": 1.56,
+            "population_volume_weighted": 0.5199
+          },
+          {
+            "q": 0.5,
+            "scalar_E_p_cubed": 0.4629,
+            "population_E_of_cube": 0.5468,
+            "understatement_x": 1.18,
+            "population_volume_weighted": 0.5999
+          }
+        ]
+      }
+    ],
+    "never_rejected_seats": {
+      "count": 189,
+      "pass_text_filter_multi_reason": 120,
+      "pass_text_filter_pct": 63.5,
+      "median_verdicts": 11,
+      "one_reject_filter_evasion_cost_pct": 9.09,
+      "worst_10": [
+        {
+          "seat_sha": "364c02d5ad1d",
+          "verdicts": 10467,
+          "distinct_texts": 5743
+        },
+        {
+          "seat_sha": "b3e86cfac3cf",
+          "verdicts": 3027,
+          "distinct_texts": 864
+        },
+        {
+          "seat_sha": "63209642c246",
+          "verdicts": 3016,
+          "distinct_texts": 857
+        },
+        {
+          "seat_sha": "3bf75448a7a3",
+          "verdicts": 2990,
+          "distinct_texts": 839
+        },
+        {
+          "seat_sha": "6586d6a93288",
+          "verdicts": 2992,
+          "distinct_texts": 838
+        },
+        {
+          "seat_sha": "74e2f72e5cc1",
+          "verdicts": 2995,
+          "distinct_texts": 837
+        },
+        {
+          "seat_sha": "f0fc013ece18",
+          "verdicts": 2989,
+          "distinct_texts": 832
+        },
+        {
+          "seat_sha": "f08a0d4c448a",
+          "verdicts": 635,
+          "distinct_texts": 635
+        },
+        {
+          "seat_sha": "aa694eb3ef48",
+          "verdicts": 392,
+          "distinct_texts": 392
+        },
+        {
+          "seat_sha": "59e825b70b89",
+          "verdicts": 379,
+          "distinct_texts": 330
+        }
+      ]
+    },
+    "single_reason_attestors": {
+      "count": 335,
+      "total_accepts": 5776,
+      "pct_of_all_accepts": 8.46,
+      "top_10": [
+        {
+          "seat_sha": "7a835ca5b696",
+          "accepts": 3019,
+          "reason": "verified criteria met."
+        },
+        {
+          "seat_sha": "60a34f3d4d5c",
+          "accepts": 572,
+          "reason": "formally verified solution with sound logical inference"
+        },
+        {
+          "seat_sha": "70227cb95d83",
+          "accepts": 470,
+          "reason": "the result contains task-specific evidence that can be checked against the job success condition."
+        },
+        {
+          "seat_sha": "857716684f4f",
+          "accepts": 118,
+          "reason": "reviewed and found the result informative and well-reasoned."
+        },
+        {
+          "seat_sha": "aee1435d90fa",
+          "accepts": 36,
+          "reason": "the delivery contains specific, correct content that actually addresses the job prompt. verified against the stated succ"
+        },
+        {
+          "seat_sha": "3f4c6ac29c6b",
+          "accepts": 34,
+          "reason": "accept: solution verified. criteria met."
+        },
+        {
+          "seat_sha": "8cf8194f3543",
+          "accepts": 34,
+          "reason": "the delivery contains specific, correct content that actually addresses the job prompt. verified against the stated succ"
+        },
+        {
+          "seat_sha": "abe46cd06007",
+          "accepts": 33,
+          "reason": "the delivery contains specific, correct content that actually addresses the job prompt. verified against the stated succ"
+        },
+        {
+          "seat_sha": "4991eaa50ded",
+          "accepts": 29,
+          "reason": "the delivery contains specific, correct content that actually addresses the job prompt. verified against the stated succ"
+        },
+        {
+          "seat_sha": "5b920861f76e",
+          "accepts": 29,
+          "reason": "the delivery contains specific, correct content that actually addresses the job prompt. verified against the stated succ"
+        }
+      ]
+    }
+  },
+  "part_b_tclk_ghost_rate": {
+    "coverage": {
+      "first": 1177,
+      "last": 2531352,
+      "span": 2530176,
+      "captured": 1553784,
+      "gaps": 1835,
+      "missing": 976392,
+      "coverage_pct": 61.4
+    },
+    "verification": {
+      "verified": 1199615,
+      "unverifiable": 310938
+    },
+    "by_rail_class": {
+      "real-rail": {
+        "offers": 15251,
+        "accepted_offers": 5253,
+        "delivered_or_settled": 1894,
+        "ghost_rate_pct": 63.9,
+        "funnel": {
+          "offers": 15251,
+          "accepted": 5253,
+          "locked": 2100,
+          "revealed": 1893,
+          "receipt": 596
+        }
+      },
+      "paper-only": {
+        "offers": 272198,
+        "accepted_offers": 199929,
+        "delivered_or_settled": 62429,
+        "ghost_rate_pct": 68.8,
+        "funnel": {
+          "offers": 272198,
+          "accepted": 199929,
+          "locked": 57418,
+          "revealed": 56583,
+          "receipt": 52902
+        }
+      },
+      "other/none": {
+        "offers": 119,
+        "accepted_offers": 83,
+        "delivered_or_settled": 0,
+        "ghost_rate_pct": 100.0,
+        "funnel": {
+          "offers": 119,
+          "accepted": 83,
+          "locked": 2,
+          "revealed": 0,
+          "receipt": 0
+        }
+      }
+    }
+  },
+  "part_c_dispute_xref": {
+    "kibble_linked_offers": 16700,
+    "crosstab": {
+      "mixed / claimed": 7,
+      "mixed / none": 654,
+      "mixed / not-accepted": 497,
+      "none / claimed": 212,
+      "none / none": 5543,
+      "none / not-accepted": 4377,
+      "none / refunded": 1,
+      "not / claimed": 14,
+      "not / none": 755,
+      "not / not-accepted": 826,
+      "not / refunded": 1,
+      "useful / claimed": 30,
+      "useful / none": 2624,
+      "useful / not-accepted": 1159
+    },
+    "useful_but_not_settled_examples": []
+  },
+  "part_c3_sample": {
+    "n": 40,
+    "job_ids": [
+      "k23dacf4522",
+      "k9d635433a5",
+      "kd718127781",
+      "kfaf3f1ff51",
+      "kdbfe5192f4",
+      "kb5b5971769",
+      "kfb0586c835",
+      "ka5393bc967",
+      "k19beeeb901",
+      "kcbef70d7d7",
+      "k79ff001365",
+      "k82cdceee24",
+      "k5139f5ae74",
+      "k9d640828a1",
+      "k3d36ec2c34",
+      "kce149d9aff",
+      "kd55f3787ac",
+      "kd5a8a47362",
+      "k2830a15c08",
+      "k1b309aa856",
+      "k9d255fdcf9",
+      "kbb08e6968e",
+      "keccfc6fe9c",
+      "k69a2e3e5c6",
+      "k2e26c306e8",
+      "k92e7d9efcb",
+      "k9c76e9b800",
+      "kba689ffe6c",
+      "k4385180a71",
+      "k45dc80af6c",
+      "k480506d49f",
+      "kbf926f88f4",
+      "kc1ac9e26c2",
+      "k6e0e77e983",
+      "k301d0e8b92",
+      "ke0e8b13894",
+      "kb55f218e14",
+      "k99c7366df0",
+      "kcdd72df188",
+      "kefcf23f599"
+    ],
+    "written_to": "graded_sample.md"
+  }
+}
