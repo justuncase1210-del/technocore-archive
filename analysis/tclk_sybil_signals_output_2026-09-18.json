@@ -1,0 +1,301 @@
+{
+  "total_records": 4295367,
+  "distinct_signers": 82762,
+  "offers_parsed": 556780,
+  "accepts_parsed": 2702214,
+  "accepts_resolved_to_an_offer": 2530365,
+  "self_accepts": 1093,
+  "self_accept_rate_pct": 0.043,
+  "reciprocal_wash_pairs": {
+    "count_of_pairs": 23494,
+    "total_accepts_in_reciprocal_pairs": 111714,
+    "top_20": [
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6MkmVY6AzA68rUv1X5bEr2f77pGLryppbKEEPFsCWeEboBD",
+        "pair_total": 126,
+        "a_to_b": 125,
+        "b_to_a": 1
+      },
+      {
+        "did_a": "did:key:z6MkqztvVMJMFDSzyo4RY9VMBmV8Mbhkm5Ve9h5CiHG42AFR",
+        "did_b": "did:key:z6MkgmPqhCfJuRGpxq4k5rEMtKENRS7AwvTR2eM7tzDGRHf7",
+        "pair_total": 126,
+        "a_to_b": 4,
+        "b_to_a": 122
+      },
+      {
+        "did_a": "did:key:z6MkjHsr1tJ7j82j7c1nwtZdtaUfh3ZDtdXmcCvvHQGccgXK",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 124,
+        "a_to_b": 10,
+        "b_to_a": 114
+      },
+      {
+        "did_a": "did:key:z6MkqztvVMJMFDSzyo4RY9VMBmV8Mbhkm5Ve9h5CiHG42AFR",
+        "did_b": "did:key:z6MkggUnd3JKCsjnz12HPbPNUNZjMdCmFrQvxJokAdPPowK4",
+        "pair_total": 120,
+        "a_to_b": 30,
+        "b_to_a": 90
+      },
+      {
+        "did_a": "did:key:z6Mkvy6extcVomgUQCSpKFaaLtrgLS84zravSYEKf3mkNt9h",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 118,
+        "a_to_b": 22,
+        "b_to_a": 96
+      },
+      {
+        "did_a": "did:key:z6Mkw3bP6UUrc5hgniWZXjf7Z8GrVa4dSy2xBJCAXBkznseP",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 115,
+        "a_to_b": 8,
+        "b_to_a": 107
+      },
+      {
+        "did_a": "did:key:z6MkrGpedt3khFhuefi6vFC3tMiwnVrmAorz77XPhUeMDC53",
+        "did_b": "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n",
+        "pair_total": 115,
+        "a_to_b": 107,
+        "b_to_a": 8
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6MkqP8hFDqDBoViXGAF3DcHnFVPcGTmHHJcYiqrjbUYEEgJ",
+        "pair_total": 113,
+        "a_to_b": 112,
+        "b_to_a": 1
+      },
+      {
+        "did_a": "did:key:z6MkjSbRcVtLELHbC4yWBdEHoUcDyiE1VCZw7ZyCW7EVk22a",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 110,
+        "a_to_b": 10,
+        "b_to_a": 100
+      },
+      {
+        "did_a": "did:key:z6MkpzVNCSidnTwfFP7kp6mGcwn2NVibSN7uU56bu2B7drpi",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 106,
+        "a_to_b": 7,
+        "b_to_a": 99
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6Mkp9iGPiPD4pKZak42dtn8T1kA1YK8rMAbphaX9M837C5D",
+        "pair_total": 105,
+        "a_to_b": 103,
+        "b_to_a": 2
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6MkeYhuL3xvjYt4by7Dy3Ra1VHSnQANqizFPE2tma969zaV",
+        "pair_total": 104,
+        "a_to_b": 103,
+        "b_to_a": 1
+      },
+      {
+        "did_a": "did:key:z6MknHwLU7Xa6K13jKsY4VewiV6JPfVUPfKQhTfYvfjSLSKE",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 102,
+        "a_to_b": 26,
+        "b_to_a": 76
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6Mkus9N78z7SQKYAKcvoe5p7rguKRVqGZSUHHk8jZDMfUNo",
+        "pair_total": 101,
+        "a_to_b": 93,
+        "b_to_a": 8
+      },
+      {
+        "did_a": "did:key:z6Mks2J7tozseMqB44NBuniCoP59CddHR1UK7z1rNyvrTDev",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 100,
+        "a_to_b": 10,
+        "b_to_a": 90
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6MkknXms4eHN5VfyrnrAKCJzNeodG2fv4dohYyqha67MGcE",
+        "pair_total": 100,
+        "a_to_b": 99,
+        "b_to_a": 1
+      },
+      {
+        "did_a": "did:key:z6MkiDU7UGw7EMUidZ7A8bQdnZ5n2BLywh1QbqAKXR1KM1tN",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 97,
+        "a_to_b": 27,
+        "b_to_a": 70
+      },
+      {
+        "did_a": "did:key:z6MkgZCuuajwCLPct4koKsTs43sAqqokVzHABKBs4BeyPtcV",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 96,
+        "a_to_b": 29,
+        "b_to_a": 67
+      },
+      {
+        "did_a": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "did_b": "did:key:z6MkiAKaYFD3F7mXpSR1PBDYEjgzSQyg7nV5Qf9wCS9Ly6HV",
+        "pair_total": 96,
+        "a_to_b": 93,
+        "b_to_a": 3
+      },
+      {
+        "did_a": "did:key:z6Mkgx2wtAbonFu1g78k8Bji4AhvtnCAqQzwiDtxQJHpQzGj",
+        "did_b": "did:key:z6MkqxchbbbaGFb1rXCYicBjm2XFNKh4YsYeHye9LS6TyNbP",
+        "pair_total": 94,
+        "a_to_b": 9,
+        "b_to_a": 85
+      }
+    ]
+  },
+  "cross_did_statement_reuse": {
+    "distinct_statements_reused": 172,
+    "examples": {
+      "0xc2c370d56bc5d985c9509a03d73acc5366a244f49717455e31b7a674d22b1433": [
+        "did:key:z6MkjW5Kkc6jznsZKX65mxj6dRNybJYYqKQvDfQ9ctSTUhXY",
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL"
+      ],
+      "0x85cfd0aa6fd90ef744440085c424903571527cdfbc1cc7a357c52b142ca288ba": [
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL",
+        "did:key:z6Mkt291ktNpZgPgPxA7qxkFgZHJ4RoofCw2NDdcRGZ8zATr"
+      ],
+      "0x498e12a0c1aaf174ff4289c98e110029a99c0c241d2e6d45a96ccd7305cd1891": [
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL",
+        "did:key:z6MkoukizKpFqhnesLJdofhVdmnMqVT4LBdRebQWRN2Trgj6"
+      ],
+      "0x5780be155b60ed72b4c75a0f69ed78fe8d621cc356e5b4986ac74e5854533564": [
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL",
+        "did:key:z6MkvJeLZYFP1zJek8JYqjSQC942eWnwcg4Y5Cpxnqcs1G5w"
+      ],
+      "0x1e82e68d910c605c0dad6e855d86d3175fda154802441c00cb6d9f9de2dcbbbf": [
+        "did:key:z6MkgWcnMf21FvBwqazE9pNeLubRvAu24wD2DDnjHbxiioHU",
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL"
+      ],
+      "0xac347cb907e95c3fbd577f73980d58739b0d1fa3103f9f13cb3a9c5b312efed2": [
+        "did:key:z6MkgNQovMrT59AT82TzfcSrTBznc2xzX3mTzUS4i5eYD8Re",
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL"
+      ],
+      "0xf53f2b69213498e52f19101c1612c0040c33412e603bd9e6c5d75f7def00e0e5": [
+        "did:key:z6MkidhWckXC7ynW56GcGKyLCwvcFtGs9bciAEqGZAEVGxHR",
+        "did:key:z6MkoA8xuzKJRGtHa5hr6znFCZq164mb45JHx6kktdJ6tMdL"
+      ],
+      "0x7f11722df47b9853ea27e533fc053d850a57aa8c81ba8d9c5e2a4ccb0647a41c": [
+        "did:key:z6MkfYQm4t5pU5SfA5Ey33r4B6TuMf7rejxhH58G5Mb3tp6p",
+        "did:key:z6Mkhu1E3TFTejNQYQNyfAtV7mwzakNaF3NpaUqsbyMua6GL"
+      ],
+      "0x8f36ee60f01bc2f7f7f98141d5d0fe0081fea0c2b3f57baccafcc8bd25379491": [
+        "did:key:z6MkfPB9yDw5yWiGADAg3y6zmxTYGLCXEkBnoHwoUbETRmJH",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0x02fd1c731516f468804653ffa88c70aecbe2b08fa95e122252561f5917b93dec": [
+        "did:key:z6MkfPB9yDw5yWiGADAg3y6zmxTYGLCXEkBnoHwoUbETRmJH",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0x54e2dfac49bfa4445fb7d33186bc42c7009bda50d47e464ede01781e7141f293": [
+        "did:key:z6MkfPB9yDw5yWiGADAg3y6zmxTYGLCXEkBnoHwoUbETRmJH",
+        "did:key:z6MkoZsXfU3U9qeUN5Tr6cKsv4uGcQcCuf2U8V9CW6NikLgi"
+      ],
+      "0x1a9ca5b83990d5015fa90f5d424c604abfd77f863dc9f8edad473177cf6551cb": [
+        "did:key:z6Mkhu1E3TFTejNQYQNyfAtV7mwzakNaF3NpaUqsbyMua6GL",
+        "did:key:z6MkoZsXfU3U9qeUN5Tr6cKsv4uGcQcCuf2U8V9CW6NikLgi"
+      ],
+      "0x070596c5cd340f0f18030bded8cb55ad11518c70890a4a7ba3b3ed743b7b5089": [
+        "did:key:z6MkfPB9yDw5yWiGADAg3y6zmxTYGLCXEkBnoHwoUbETRmJH",
+        "did:key:z6MkugzRZLqRFeEREXAN942Edn8YYS9RJ21w9SPYa27NYiLV"
+      ],
+      "0xec539ebedd41d34810f8e43e6d0ace64e43167b3ca2e6ee6d061a853b5757718": [
+        "did:key:z6MkfYQm4t5pU5SfA5Ey33r4B6TuMf7rejxhH58G5Mb3tp6p",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0xd86326630ea4f372f03b4484516e8a1f04ba61a12131fa4545a984773333e69a": [
+        "did:key:z6MkoZsXfU3U9qeUN5Tr6cKsv4uGcQcCuf2U8V9CW6NikLgi",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0xd9806b02985027b98d4727e89c435206d53bc4396178d9e8e8e79dfd45a9cd6d": [
+        "did:key:z6Mkhu1E3TFTejNQYQNyfAtV7mwzakNaF3NpaUqsbyMua6GL",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0x8012131eaabb55de68a17deafc4bb8f6d5dc9e20549b0ae46f8a4b67047ef7ee": [
+        "did:key:z6MkfYQm4t5pU5SfA5Ey33r4B6TuMf7rejxhH58G5Mb3tp6p",
+        "did:key:z6MkuLcmfR9DbZfP1YyVqfsTjppCXie9w6x6dLZbGF2UbF2n"
+      ],
+      "0x575030cbd6d52837f3193c1d121d82401f414b5daa655c29797897d3aaa6893e": [
+        "did:key:z6MkfPB9yDw5yWiGADAg3y6zmxTYGLCXEkBnoHwoUbETRmJH",
+        "did:key:z6MkugzRZLqRFeEREXAN942Edn8YYS9RJ21w9SPYa27NYiLV"
+      ],
+      "0x2cd7bffe4e03eae1514a7b41c6bc387cfdc229f943c7e7df4be7b8a96c71b0dd": [
+        "did:key:z6MkoZsXfU3U9qeUN5Tr6cKsv4uGcQcCuf2U8V9CW6NikLgi",
+        "did:key:z6MkugzRZLqRFeEREXAN942Edn8YYS9RJ21w9SPYa27NYiLV"
+      ],
+      "0x0984c612e9c2bc9ec93fcd69e00d353ed9977029efc24872aeb708e300e4575d": [
+        "did:key:z6Mkhu1E3TFTejNQYQNyfAtV7mwzakNaF3NpaUqsbyMua6GL",
+        "did:key:z6MkoZsXfU3U9qeUN5Tr6cKsv4uGcQcCuf2U8V9CW6NikLgi"
+      ]
+    }
+  },
+  "mint_and_transact": {
+    "mint_window_seconds": 60.0,
+    "offers_within_window_of_posters_first_message": 14377,
+    "offers_within_window_pct": 2.582,
+    "accepts_within_window_of_accepters_first_message": 30304,
+    "accepts_within_window_pct": 1.121
+  },
+  "offer_to_accept_latency_seconds": {
+    "mint_accepters": {
+      "n": 29304,
+      "p10": 0.102,
+      "p50": 1.921,
+      "p90": 31.364,
+      "mean": 29.392
+    },
+    "established_accepters": {
+      "n": 2501061,
+      "p10": 1.205,
+      "p50": 6.904,
+      "p90": 23.49,
+      "mean": 208.143
+    }
+  },
+  "daily_new_signers": {
+    "2026-09-02": 406,
+    "2026-09-03": 1886,
+    "2026-09-04": 3236,
+    "2026-09-05": 2075,
+    "2026-09-06": 730,
+    "2026-09-07": 3906,
+    "2026-09-08": 2123,
+    "2026-09-09": 4699,
+    "2026-09-10": 23631,
+    "2026-09-11": 13631,
+    "2026-09-12": 3498,
+    "2026-09-13": 2482,
+    "2026-09-14": 3263,
+    "2026-09-15": 780,
+    "2026-09-16": 2090,
+    "2026-09-17": 13219,
+    "2026-09-18": 1107
+  },
+  "daily_cumulative_signers": {
+    "2026-09-02": 406,
+    "2026-09-03": 2292,
+    "2026-09-04": 5528,
+    "2026-09-05": 7603,
+    "2026-09-06": 8333,
+    "2026-09-07": 12239,
+    "2026-09-08": 14362,
+    "2026-09-09": 19061,
+    "2026-09-10": 42692,
+    "2026-09-11": 56323,
+    "2026-09-12": 59821,
+    "2026-09-13": 62303,
+    "2026-09-14": 65566,
+    "2026-09-15": 66346,
+    "2026-09-16": 68436,
+    "2026-09-17": 81655,
+    "2026-09-18": 82762
+  }
+}
