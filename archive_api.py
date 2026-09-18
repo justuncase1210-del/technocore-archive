@@ -32,10 +32,13 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -70,66 +73,134 @@ ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")  # matches technocore-chat's
 # same-process-lifetime dedup -- _is_already_watched below is what actually
 # prevents duplicates across an API restart, since watcher subprocesses are
 # detached (start_new_session=True) and outlive this process on purpose.
+# Re-resolved on every call (see _resolve_uv below) rather than cached once
+# at import time -- PATH can be transiently incomplete for a moment during
+# container boot (confirmed live: a race with this container's own init-mods
+# step meant PATH lacked uv's directory at the exact instant this module was
+# first imported, even though the run script's own PATH export was correct
+# moments later). Caching that one bad snapshot would wrongly mark uv
+# unavailable for this process's entire lifetime, even once PATH is fine.
+_uv_missing_warned = False
+
+
+def _resolve_uv() -> str | None:
+    """Absolute path to uv, or None if not currently resolvable. Checked
+    fresh each call -- see the module-level comment above for why this
+    isn't cached. Falls back to known absolute install locations if
+    PATH resolution fails -- confirmed live, twice, that this
+    container's own PATH/init fix doesn't reliably survive a real
+    reboot, so this stops depending on getting that right at all."""
+    found = shutil.which("uv")
+    if found:
+        return found
+    for candidate in ("/config/.local/bin/uv", "/usr/local/bin/uv"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _warn_uv_missing_once() -> None:
+    """Logs once, not per-room, so a genuinely-missing uv doesn't spam
+    the log on every _resume_watchers() pass or registration attempt."""
+    global _uv_missing_warned
+    if not _uv_missing_warned:
+        _uv_missing_warned = True
+        print(
+            "CRITICAL: 'uv' not found on PATH -- watcher subprocesses cannot "
+            "be started. Existing archives will still be served (reads are "
+            "unaffected), but no room will pick up new messages until this is "
+            "fixed. Check that uv is installed and PATH is correct.",
+            file=sys.stderr, flush=True,
+        )
+
 WATCHED: dict[str, subprocess.Popen] = {}
+ROOMS_FILE = Path("/config/workspace/rooms.txt")
+
+
+def _read_watched_rooms() -> list[str]:
+    """Rooms watch-all is (or will be, within one --rescan-seconds cycle)
+    covering. Same file watch-all itself re-reads on a timer -- this is the
+    single shared source of truth for "what's being watched" now that there
+    is one always-running threaded watcher process (started by s6 at boot),
+    not one subprocess per room spawned by this API."""
+    try:
+        with open(ROOMS_FILE, encoding="utf-8") as f:
+            return [line.strip() for line in f
+                    if line.strip() and not line.startswith("#")]
+    except FileNotFoundError:
+        return []
 
 
 def _is_already_watched(room: str) -> bool:
-    """True if a `watch <room>` process is running, spawned by this instance
-    or a prior one (detached watchers survive an API restart). Checked via
-    the real process table, not just WATCHED, specifically so a restart
-    doesn't spawn duplicates racing to append the same messages twice."""
-    if room in WATCHED and WATCHED[room].poll() is None:
-        return True
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", f"technocore.py watch {room} "],
-            capture_output=True, timeout=5,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False  # pgrep unavailable -- fall through and let it spawn
+    """True if `room` is already listed in rooms.txt."""
+    return room in _read_watched_rooms()
 
 
 def _watched_room_count() -> int:
-    """Count of rooms currently registered, for the capacity cap.
+    """Count of rooms currently registered, for the capacity cap."""
+    return len(_read_watched_rooms())
 
-    Counts watch-*.log files, NOT *.jsonl archives. The log file is opened
-    synchronously in _start_watcher before the subprocess is even spawned;
-    the .jsonl only appears once that subprocess completes its first real
-    network round-trip to technocore.chat, which can take a second or more
-    (longer under load -- we've seen 503s and 15s timeouts from that service
-    tonight). Counting .jsonl files let a burst of rapid registrations all
-    pass the cap check simultaneously, since none of their archives existed
-    yet at check time -- confirmed by a fuzz test before this shipped: 5
-    rapid registrations against a cap of 3 all returned "watching". Counting
-    the log file instead reflects capacity used the instant a registration
-    is accepted, not once its first write eventually lands."""
-    if not ARCHIVE_DIR.exists():
-        return 0
-    return sum(1 for _ in ARCHIVE_DIR.glob("watch-*.log"))
+
 def _start_watcher(room: str) -> str:
-    """Launch `technocore.py watch <room>` detached, so it outlives this API
-    process if it restarts. Returns "started", "already_watching", or
-    "capacity_reached".
+    """Register `room` by appending it to rooms.txt -- the always-running
+    watch-all process (s6-supervised, started at container boot) re-reads
+    this file every --rescan-seconds and picks up new rooms on its own,
+    without this API spawning or supervising any process itself. Returns
+    "started", "already_watching", or "capacity_reached".
 
     The cap only blocks a room with no archive file yet -- a genuinely new
     registration. A room that already has an archive file is always resumed
-    unconditionally, uncapped: it already counts toward existing disk/process
-    usage, so refusing to resume it on restart wouldn't free any capacity, it
-    would just silently stop archiving a room someone already paid for."""
+    unconditionally, uncapped: it already counts toward existing disk usage,
+    so refusing to resume it on restart wouldn't free any capacity, it would
+    just silently stop archiving a room someone already paid for."""
     archive_exists = (ARCHIVE_DIR / f"{room}.jsonl").exists()
     if _is_already_watched(room):
         return "already_watching"
     if not archive_exists and _watched_room_count() >= MAX_WATCHED_ROOMS:
         return "capacity_reached"
+    ROOMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(ROOMS_FILE, "a", encoding="utf-8") as f:
+        f.write(room + "\n")
+    return "started"
+
+
+def _watch_all_is_running() -> bool:
+    """True if a `watch-all` process is already active, spawned by this
+    instance or a prior one (detached, so it survives an API restart)."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "technocore.py watch-all"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _ensure_watch_all_running() -> None:
+    """Launch the consolidated multi-room watcher detached, so it outlives
+    this API process if it restarts. One process for every room listed in
+    rooms.txt, instead of one subprocess per room. custom-cont-init.d does
+    not work on this image (confirmed: /custom-cont-init.d is not on the
+    persistent volume and is never populated), so this is the only
+    reliable place left to (re)launch it -- this function's own caller,
+    archive_api.py, is a real s6-supervised service that has started on
+    every boot."""
+    if _watch_all_is_running():
+        return
+    uv_bin = _resolve_uv()
+    if uv_bin is None:
+        _warn_uv_missing_once()
+        return
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = ARCHIVE_DIR / f"watch-{room}.log"
+    log_path = ARCHIVE_DIR / "watch-all.log"
     log_file = open(log_path, "a")
-    proc = subprocess.Popen(
+    subprocess.Popen(
         [
-            "uv", "run", str(TECHNOCORE_SCRIPT), "watch", room,
-            "--out", str(ARCHIVE_DIR / f"{room}.jsonl"),
-            "--wait", "25",
+            uv_bin, "run", str(TECHNOCORE_SCRIPT), "watch-all",
+            "--rooms-file", str(ROOMS_FILE),
+            "--out-dir", str(ARCHIVE_DIR),
+            "--wait", "25", "--rescan-seconds", "30",
         ],
         cwd=str(TECHNOCORE_SCRIPT.parent),
         stdout=log_file,
@@ -137,18 +208,18 @@ def _start_watcher(room: str) -> str:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
-    WATCHED[room] = proc
-    return "started"
 
 
 def _resume_watchers() -> None:
-    """Startup self-heal: every room that already has an archive file gets a
-    watcher checked/started, so an API restart doesn't require manually
-    re-running nohup commands for every previously-registered room."""
-    if not ARCHIVE_DIR.exists():
-        return
-    for path in ARCHIVE_DIR.glob("*.jsonl"):
-        _start_watcher(path.stem)
+    """Startup self-heal: every room that already has an archive file is
+    guaranteed to be listed in rooms.txt, so an API restart doesn't require
+    manually re-registering every previously-registered room. Also ensures
+    the watch-all process itself is running (relaunched here if it died --
+    this function already runs at startup and on every watchdog tick)."""
+    if ARCHIVE_DIR.exists():
+        for path in ARCHIVE_DIR.glob("*.jsonl"):
+            _start_watcher(path.stem)
+    _ensure_watch_all_running()
 
 
 # How often the watchdog re-checks for a dead watcher subprocess. Without this,
@@ -157,17 +228,66 @@ def _resume_watchers() -> None:
 # this catches that within one interval instead of by accident at the next
 # manual status check.
 WATCHDOG_INTERVAL_SECONDS = 600
+TCLK_INDEX_REBUILD_EVERY_N_TICKS = 36  # ~every 6 hours, since each tick is WATCHDOG_INTERVAL_SECONDS (600s)
+
+
+def _rebuild_tclk_did_index_async() -> None:
+    """Kicks off the tclk risk-check index rebuild as a detached subprocess, never
+    inline in this process -- it's a full streaming pass over tclk-offers.jsonl
+    (multi-million lines, ~1-2GB peak RSS observed), and this API and watch-all
+    already share a tight 2GB container ceiling with no room to absorb that spike
+    in-process. Fire-and-forget: failures here just mean risk-check serves a
+    slightly-stale index next time, not a crash."""
+    uv_bin = _resolve_uv()
+    tclk_archive = ARCHIVE_DIR / "tclk-offers.jsonl"
+    script = Path(__file__).parent / "tclk_sybil_signals_v2.py"
+    if uv_bin is None or not tclk_archive.exists() or not script.exists():
+        return
+    try:
+        already = subprocess.run(
+            ["pgrep", "-f", "tclk_sybil_signals_v2.py"],
+            capture_output=True, timeout=5,
+        )
+        if already.returncode == 0:
+            return  # a rebuild is already in flight -- never stack a second ~1-2GB pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        subprocess.Popen(
+            [
+                uv_bin, "run", str(script), str(tclk_archive),
+                "--out", str(Path(__file__).parent / "sybil_signals.json"),
+                "--did-index-out", str(Path(__file__).parent / "tclk_did_index.json"),
+            ],
+            cwd=str(Path(__file__).parent),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+_watchdog_tick_count = 0
 
 
 async def _watchdog_loop() -> None:
+    global _watchdog_tick_count
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
         _resume_watchers()
+        _watchdog_tick_count += 1
+        if _watchdog_tick_count % TCLK_INDEX_REBUILD_EVERY_N_TICKS == 0:
+            _rebuild_tclk_did_index_async()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _resume_watchers()
+    # NOT calling _rebuild_tclk_did_index_async() here anymore -- every container
+    # boot (intentional restart or crash recovery) was triggering it immediately,
+    # pushing memory to ~2.14GB against a 2GB ceiling and plausibly causing the
+    # very crash that led to the next reboot. Only the periodic watchdog tick
+    # (every 6h) runs it now, so a restart itself is always safe.
     watchdog_task = asyncio.create_task(_watchdog_loop())
     # The MCP streamable-HTTP sub-app needs its own session-manager task group
     # entered, which normally happens automatically via mcp_server.run() when
@@ -321,6 +441,37 @@ routes: dict[str, RouteConfig] = {
         "lines from a shared room are skipped individually rather than failing the whole audit.",
         {"contract": "0x0000000000000000000000000000000000000000000000000000000000000000"},
     ),
+    "POST /api/v1/votes/standings": _route(
+        "$0.015",
+        "Compute standings for a durably-archived vote room (e.g. a sonnet.ballot.v1-style "
+        "contest), past the live service's own short retention window for ballot data. Returns "
+        "the raw tally (every ballot, stuffing-visible), two deduped tallies (one ballot per "
+        "distinct voter DID, by their first or final vote), and a full per-voter breakdown "
+        "including each voter's first-seen timestamp in the room, so standings can be "
+        "independently verified rather than trusted as a bare number. Room must already be "
+        "durably archived -- register it first via POST /api/v1/archive/register if not.",
+        {"room": "mb-sonnet-2-votes", "contest_id": "sonnet-2"},
+    ),
+    "POST /api/v1/kibble/attestor-check": _route(
+        "$0.01",
+        "Check a kibble job or attestor DID against the durable kibble archive for boilerplate "
+        "attestation reuse: whether an ATTEST's exact reason text has been posted verbatim by "
+        "the same attestor on other, unrelated jobs -- a mechanical signal of templated "
+        "rubber-stamping, not a judgment call on any single attestation. Provide 'job_id' to "
+        "check one job's deliverables and attestations, or 'attestor_did' to get an attestor's "
+        "overall boilerplate-reuse rate and most-repeated reason texts.",
+        {"job_id": "kXXXXXXXXXX"},
+    ),
+    "POST /api/v1/tclk/risk-check": _route(
+        "$0.012",
+        "Pre-trade counterparty risk signal for a DID, computed from the durable tclk-offers "
+        "archive and refreshed roughly hourly: self-accept history, reciprocal wash-trading "
+        "pair involvement (this DID accepting, and being accepted by, the same counterparty "
+        "repeatedly), and hash-lock statement reuse across distinct DIDs. Absence of a finding "
+        "is not proof of good standing -- only that this DID hasn't shown these specific "
+        "patterns as of the last index rebuild (see 'generated_at' in the response).",
+        {"did": "did:key:..."},
+    ),
 }
 
 app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
@@ -359,6 +510,22 @@ def _iter_messages(path: Path):
                 continue
 
 
+ATTEST_RE = re.compile(r"^ATTEST\s+v1\s*\|\s*(\S+)\s*\|\s*(useful|not)\s*\|\s*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _kibble_parse_line(text: str):
+    """Returns (kind, job_id, payload) for a JOB/DELIVER/RESULT/ATTEST line from
+    the kibble protocol, or None for anything else. payload is the raw line text
+    for JOB/DELIVER/RESULT, or (verdict, reason) for ATTEST."""
+    parts = text.split(" | ", 2)
+    if len(parts) >= 2 and parts[0] in ("JOB v1", "DELIVER v1", "RESULT v1"):
+        return parts[0].split()[0], parts[1], text
+    m = ATTEST_RE.match(text)
+    if m:
+        return "ATTEST", m.group(1), (m.group(2).lower(), m.group(3).strip())
+    return None
+
+
 LANDING_HTML_PATH = Path(__file__).parent / "landing.html"
 
 
@@ -376,7 +543,13 @@ def landing_page():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "network": NETWORK, "address": WALLET_ADDRESS}
+    return {
+        "ok": True,
+        "network": NETWORK,
+        "address": WALLET_ADDRESS,
+        "uv_available": _resolve_uv() is not None,
+        "node_available": _resolve_node() is not None,
+    }
 
 
 # /rooms and /stats each do a full scan of every archived message to compute
@@ -548,7 +721,12 @@ async def archive_register(body: dict = None):
             "(lowercase letters, digits, - and _, 1-48 chars)",
         )
     result = _start_watcher(room)
-    status = {"started": "watching", "already_watching": "already_watching", "capacity_reached": "capacity_reached"}[result]
+    status = {
+        "started": "watching",
+        "already_watching": "already_watching",
+        "capacity_reached": "capacity_reached",
+        "uv_unavailable": "uv_unavailable",
+    }[result]
     note = (
         "this paid for archiving infrastructure, not for a message -- posting to "
         "technocore-chat is free on both the signed and unsigned lanes"
@@ -559,6 +737,13 @@ async def archive_register(body: dict = None):
             "this room was NOT registered -- your payment was still collected, since "
             "x402 settles before this handler runs; contact the operator about a "
             "refund or wait for capacity to free up and retry."
+        )
+    elif result == "uv_unavailable":
+        note += (
+            ". this instance's 'uv' runtime is currently unavailable, so this room "
+            "could NOT be registered for live archiving -- your payment was still "
+            "collected, since x402 settles before this handler runs; contact the "
+            "operator about a refund or retry once uv is restored."
         )
     return {"room": room, "status": status, "note": note}
 
@@ -620,6 +805,32 @@ async def archive_verify(body: dict = None):
     }
 
 
+# Both this and kibble/attestor-check below are synchronous, CPU/IO-bound scans
+# over the full archive (up to 19GB) with no internal await -- run directly in an
+# async def, a single call blocks the ENTIRE event loop (every other request,
+# including /health) until it finishes. asyncio.to_thread() moves the scan off
+# the event loop; the shared semaphore caps how many of these two heaviest
+# endpoints can run at once, so a burst of concurrent agent calls can't stack
+# unboundedly on top of each other (or the periodic tclk risk-check rebuild).
+_HEAVY_SCAN_SEMAPHORE = asyncio.Semaphore(2)
+
+
+def _archive_search_all_scan(regex, limit):
+    results = []
+    rooms_searched = []
+    if ARCHIVE_DIR.exists():
+        for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
+            rooms_searched.append(path.stem)
+            for msg in _iter_messages(path):
+                if regex.search(msg.get("text", "")):
+                    results.append({**msg, "room": path.stem})
+                    if len(results) >= limit:
+                        break
+            if len(results) >= limit:
+                break
+    return rooms_searched, results
+
+
 @app.post("/api/v1/archive/search-all")
 async def archive_search_all(body: dict = None):
     body = body or {}
@@ -636,18 +847,9 @@ async def archive_search_all(body: dict = None):
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"invalid regex: {e}")
 
-    results = []
-    rooms_searched = []
-    if ARCHIVE_DIR.exists():
-        for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
-            rooms_searched.append(path.stem)
-            for msg in _iter_messages(path):
-                if regex.search(msg.get("text", "")):
-                    results.append({**msg, "room": path.stem})
-                    if len(results) >= limit:
-                        break
-            if len(results) >= limit:
-                break
+    async with _HEAVY_SCAN_SEMAPHORE:
+        rooms_searched, results = await asyncio.to_thread(_archive_search_all_scan, regex, limit)
+
     return {
         "pattern": pattern,
         "rooms_searched": rooms_searched,
@@ -761,6 +963,20 @@ async def web_browse(body: dict = None):
 import subprocess
 
 TCLK_AUDIT_SCRIPT = Path(__file__).parent / "tclk_audit.mjs"
+
+
+def _resolve_node() -> str | None:
+    """Same reasoning as _resolve_uv above: checked fresh each call, not
+    cached at import time, with the same absolute-path fallback."""
+    found = shutil.which("node")
+    if found:
+        return found
+    for candidate in ("/config/.local/node/bin/node", "/usr/local/bin/node", "/usr/bin/node"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 CONTRACT_RE = re.compile(r"^0x[0-9a-f]{64}$")
 
 
@@ -807,10 +1023,13 @@ async def tclk_audit(body: dict = None):
 
     deal_room = "mb-p-tclk-" + contract[2:18]
     deal_room_status = None
-    if ROOM_RE.fullmatch(deal_room):
+    uv_bin = _resolve_uv()
+    if ROOM_RE.fullmatch(deal_room) and uv_bin is None:
+        deal_room_status = "uv_unavailable"
+    elif ROOM_RE.fullmatch(deal_room):
         try:
             proc = subprocess.run(
-                ["uv", "run", "technocore.py", "read", deal_room, "--since", "0", "--limit", "2000", "--json"],
+                [uv_bin, "run", "technocore.py", "read", deal_room, "--since", "0", "--limit", "2000", "--json"],
                 cwd=str(Path(__file__).parent),
                 capture_output=True, text=True, timeout=30,
             )
@@ -837,9 +1056,16 @@ async def tclk_audit(body: dict = None):
             detail=f"no records found for contract {contract} in our tclk-offers archive or the live deal room",
         )
 
+    node_bin = _resolve_node()
+    if node_bin is None:
+        raise HTTPException(
+            status_code=503,
+            detail="tclk audit temporarily unavailable: 'node' is not installed on this host",
+        )
+
     audit_input = "\n".join(lines)
     result = subprocess.run(
-        ["node", str(TCLK_AUDIT_SCRIPT), contract],
+        [node_bin, str(TCLK_AUDIT_SCRIPT), contract],
         input=audit_input, capture_output=True, text=True, timeout=30,
         cwd=str(Path(__file__).parent),
     )
@@ -1096,6 +1322,256 @@ app.mount(
         ),
     ),
 )
+
+
+MAX_VOTERS_IN_RESPONSE = 500
+
+
+@app.post("/api/v1/votes/standings")
+async def votes_standings(body: dict = None):
+    body = body or {}
+    room = body.get("room")
+    if not isinstance(room, str) or not ROOM_RE.fullmatch(room):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'room'")
+    contest_id = body.get("contest_id")
+    if contest_id is not None and not isinstance(contest_id, str):
+        raise HTTPException(status_code=400, detail="'contest_id' must be a string if provided")
+
+    path = ARCHIVE_DIR / f"{room}.jsonl"
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"room '{room}' is not archived yet -- register it first via POST /api/v1/archive/register",
+        )
+
+    raw_tally = collections.Counter()
+    first_ballot: dict[str, dict] = {}
+    last_ballot: dict[str, dict] = {}
+    ballot_count_by_voter = collections.Counter()
+    first_seen_in_room: dict[str, str] = {}
+    total_ballots = 0
+    malformed = 0
+
+    for msg in _iter_messages(path):
+        did = msg.get("from")
+        ts = msg.get("ts")
+        if did and did not in first_seen_in_room:
+            first_seen_in_room[did] = ts
+        text = (msg.get("text") or "").strip()
+        try:
+            b = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(b, dict) or b.get("type") != "sonnet.ballot.v1":
+            continue
+        if contest_id and b.get("contest_id") != contest_id:
+            continue
+        entry = b.get("entry_id")
+        voter = b.get("voter_did") or did
+        if not entry or not voter:
+            malformed += 1
+            continue
+        total_ballots += 1
+        raw_tally[entry] += 1
+        ballot_count_by_voter[voter] += 1
+        rec = {"entry_id": entry, "ts": ts, "seq": msg.get("seq")}
+        first_ballot.setdefault(voter, rec)
+        last_ballot[voter] = rec
+
+    if total_ballots == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="no sonnet.ballot.v1 records found in this room"
+            + (f" for contest_id={contest_id!r}" if contest_id else ""),
+        )
+
+    dedup_first_tally = collections.Counter(b["entry_id"] for b in first_ballot.values())
+    dedup_last_tally = collections.Counter(b["entry_id"] for b in last_ballot.values())
+
+    voters = [
+        {
+            "voter_did": v,
+            "ballots_cast": ballot_count_by_voter[v],
+            "first_choice": first_ballot[v]["entry_id"],
+            "final_choice": last_ballot[v]["entry_id"],
+            "first_seen_in_room": first_seen_in_room.get(v),
+        }
+        for v in last_ballot
+    ]
+    voters.sort(key=lambda v: -v["ballots_cast"])
+
+    return {
+        "room": room,
+        "contest_id": contest_id,
+        "total_ballots_seen": total_ballots,
+        "malformed_ballots_skipped": malformed,
+        "distinct_voters": len(last_ballot),
+        "raw_tally": dict(raw_tally.most_common()),
+        "dedup_first_tally": dict(dedup_first_tally.most_common()),
+        "dedup_last_tally": dict(dedup_last_tally.most_common()),
+        "voters_by_ballots_cast_desc": voters[:MAX_VOTERS_IN_RESPONSE],
+        "voters_truncated": len(voters) > MAX_VOTERS_IN_RESPONSE,
+        "note": (
+            "raw_tally counts every ballot including repeats (stuffing-visible); "
+            "dedup_*_tally counts one ballot per distinct voter_did, by their first "
+            "or final vote. first_seen_in_room supports an independent DID-age filter."
+        ),
+    }
+
+
+def _kibble_attestor_check_scan(path, job_id, attestor_did):
+    job_record = {"job": None, "deliver": [], "result": [], "attest": []}
+    attestor_records = []
+
+    for msg in _iter_messages(path):
+        text = (msg.get("text") or "").strip()
+        parsed = _kibble_parse_line(text)
+        if parsed is None:
+            continue
+        kind, jid, payload = parsed
+
+        if job_id and jid == job_id:
+            if kind == "JOB":
+                job_record["job"] = payload
+            elif kind == "DELIVER":
+                job_record["deliver"].append(payload)
+            elif kind == "RESULT":
+                job_record["result"].append(payload)
+            elif kind == "ATTEST":
+                verdict, reason = payload
+                job_record["attest"].append({"from": msg.get("from"), "verdict": verdict, "reason": reason})
+
+        if attestor_did and kind == "ATTEST" and msg.get("from") == attestor_did:
+            verdict, reason = payload
+            attestor_records.append({"job_id": jid, "verdict": verdict, "reason": reason, "ts": msg.get("ts")})
+
+    target_texts = set()
+    for a in job_record["attest"]:
+        target_texts.add(a["reason"])
+    for a in attestor_records:
+        target_texts.add(a["reason"])
+
+    reuse_by_text: dict[str, set] = {t: set() for t in target_texts}
+    if target_texts:
+        for msg in _iter_messages(path):
+            text = (msg.get("text") or "").strip()
+            parsed = _kibble_parse_line(text)
+            if parsed is None or parsed[0] != "ATTEST":
+                continue
+            _, jid, attest_payload = parsed
+            _, reason = attest_payload
+            if reason in reuse_by_text:
+                reuse_by_text[reason].add(jid)
+
+    return job_record, attestor_records, reuse_by_text
+
+
+@app.post("/api/v1/kibble/attestor-check")
+async def kibble_attestor_check(body: dict = None):
+    body = body or {}
+    job_id = body.get("job_id")
+    attestor_did = body.get("attestor_did")
+    if job_id is not None and not isinstance(job_id, str):
+        raise HTTPException(status_code=400, detail="'job_id' must be a string")
+    if attestor_did is not None and not isinstance(attestor_did, str):
+        raise HTTPException(status_code=400, detail="'attestor_did' must be a string")
+    if not job_id and not attestor_did:
+        raise HTTPException(status_code=400, detail="Provide 'job_id' or 'attestor_did'")
+
+    path = ARCHIVE_DIR / "kibble.jsonl"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="kibble room is not archived on this instance")
+
+    async with _HEAVY_SCAN_SEMAPHORE:
+        job_record, attestor_records, reuse_by_text = await asyncio.to_thread(
+            _kibble_attestor_check_scan, path, job_id, attestor_did
+        )
+
+    if job_id and job_record["job"] is None and not job_record["attest"]:
+        raise HTTPException(status_code=404, detail=f"job '{job_id}' not found in the durable kibble archive")
+    if attestor_did and not attestor_records:
+        raise HTTPException(status_code=404, detail=f"no attestations from '{attestor_did}' found in the durable kibble archive")
+
+    result: dict = {}
+    if job_id:
+        result["job_id"] = job_id
+        result["job"] = job_record["job"]
+        result["deliverables"] = job_record["deliver"]
+        result["results"] = job_record["result"]
+        result["attestations"] = [
+            {
+                **a,
+                "reason_used_on_n_distinct_jobs": len(reuse_by_text.get(a["reason"], set())),
+                "boilerplate_suspect": len(reuse_by_text.get(a["reason"], set())) > 1,
+            }
+            for a in job_record["attest"]
+        ]
+    if attestor_did:
+        total = len(attestor_records)
+        boilerplate = sum(1 for a in attestor_records if len(reuse_by_text.get(a["reason"], set())) > 1)
+        by_reason = collections.Counter(a["reason"] for a in attestor_records)
+        result["attestor_did"] = attestor_did
+        result["total_attestations_seen"] = total
+        result["boilerplate_rate_pct"] = round(100.0 * boilerplate / total, 3) if total else None
+        result["most_repeated_reasons"] = [
+            {
+                "reason": r[:200],
+                "times_used_by_this_attestor": c,
+                "distinct_jobs_this_exact_text_appears_on": len(reuse_by_text.get(r, set())),
+            }
+            for r, c in by_reason.most_common(10)
+        ]
+        result["note"] = (
+            "boilerplate_rate_pct is the fraction of this attestor's attestations whose exact "
+            "reason text also appears, verbatim, on 2+ distinct jobs -- a mechanical signal, "
+            "not a judgment on whether any single attestation was correct."
+        )
+    return result
+
+
+@app.post("/api/v1/tclk/risk-check")
+async def tclk_risk_check(body: dict = None):
+    body = body or {}
+    did = body.get("did")
+    if not isinstance(did, str) or not did.startswith("did:key:"):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'did' -- must be a did:key: string")
+
+    index_path = Path(__file__).parent / "tclk_did_index.json"
+    if not index_path.exists():
+        raise HTTPException(status_code=503, detail="risk-check index not built yet -- try again shortly")
+
+    with open(index_path, encoding="utf-8") as f:
+        index = json.load(f)
+
+    entry = index.get("dids", {}).get(did)
+    generated_at = index.get("generated_at")
+    if entry is None:
+        return {
+            "did": did,
+            "generated_at": generated_at,
+            "found": False,
+            "note": (
+                "no tclk offer/accept activity for this DID as of the last index rebuild -- "
+                "absence is not proof of good standing, only that this DID hasn't transacted yet."
+            ),
+        }
+    reciprocal_total = sum(p["total"] for p in entry["reciprocal_partners"])
+    return {
+        "did": did,
+        "generated_at": generated_at,
+        "found": True,
+        "offers_posted": entry["offers_posted"],
+        "accepts_made": entry["accepts_made"],
+        "self_accepts": entry["self_accepts"],
+        "self_accept_flag": entry["self_accepts"] > 0,
+        "reciprocal_wash_pair_partners": len(entry["reciprocal_partners"]),
+        "reciprocal_wash_pair_accepts_total": reciprocal_total,
+        "reciprocal_wash_pair_flag": len(entry["reciprocal_partners"]) > 0,
+        "reused_statements_count": len(entry["reused_statements"]),
+        "statement_reuse_flag": len(entry["reused_statements"]) > 0,
+        "detail": entry,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
