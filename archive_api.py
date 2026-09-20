@@ -275,6 +275,7 @@ async def _watchdog_loop() -> None:
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
         _resume_watchers()
+        await asyncio.to_thread(_refresh_room_and_stats_caches)
         _watchdog_tick_count += 1
         if _watchdog_tick_count % TCLK_INDEX_REBUILD_EVERY_N_TICKS == 0:
             _rebuild_tclk_did_index_async()
@@ -283,6 +284,12 @@ async def _watchdog_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _resume_watchers()
+    # Fire-and-forget: populate the rooms/stats cache once at boot without
+    # blocking startup on a multi-second (or, at current archive sizes,
+    # multi-minute) full scan. Without this, /rooms and /stats serve
+    # 'warming_up' for a full WATCHDOG_INTERVAL_SECONDS (10 min) after every
+    # restart before the first watchdog tick would otherwise populate them.
+    asyncio.create_task(asyncio.to_thread(_refresh_room_and_stats_caches))
     # NOT calling _rebuild_tclk_did_index_async() here anymore -- every container
     # boot (intentional restart or crash recovery) was triggering it immediately,
     # pushing memory to ~2.14GB against a 2GB ceiling and plausibly causing the
@@ -572,33 +579,71 @@ def _cached(key: str, compute):
     return value
 
 
+def _compute_rooms() -> dict:
+    out = []
+    if ARCHIVE_DIR.exists():
+        for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
+            first_seq = last_seq = None
+            count = 0
+            for msg in _iter_messages(path):
+                if first_seq is None:
+                    first_seq = msg.get("seq")
+                last_seq = msg.get("seq")
+                count += 1
+            out.append(
+                {
+                    "room": path.stem,
+                    "archived_messages": count,
+                    "first_seq": first_seq,
+                    "last_seq": last_seq,
+                    "bytes": path.stat().st_size,
+                }
+            )
+    return {"rooms": out}
+
+
+def _compute_stats_all() -> dict:
+    if not ARCHIVE_DIR.exists():
+        return {"rooms": []}
+    return {"rooms": [_room_stats(p) for p in sorted(ARCHIVE_DIR.glob("*.jsonl"))]}
+
+
+def _refresh_room_and_stats_caches() -> None:
+    """Proactively recomputes the two full-archive-scan caches ('rooms' and
+    'stats:_all_') in the background, on the watchdog's own cadence -- never
+    inline in a request. Confirmed live (2026-09-20): once the ingress was
+    fixed to actually reach this port, /rooms and /stats immediately started
+    timing out (504) at the gateway on a cold cache, because lobby.jsonl alone
+    had grown to 7.5GB since the 12.5s/14.8s measurement this cache was
+    originally sized against. A lazy TTL cache still lets the first caller
+    after any restart eat that full scan live; only a caller-independent
+    background refresh actually removes the timeout risk, since no client-side
+    threading fixes a response that's simply too slow for the gateway's own
+    timeout. Per-room '/stats?room=X' is left on the original lazy _cached()
+    path -- a single room's file is far cheaper than scanning every room, and
+    a brand new room has no warm entry to serve until it's queried once anyway."""
+    try:
+        _endpoint_cache["rooms"] = (time.time(), _compute_rooms())
+    except Exception:
+        pass
+    try:
+        _endpoint_cache["stats:_all_"] = (time.time(), _compute_stats_all())
+    except Exception:
+        pass
+
+
 @app.get("/rooms")
 def rooms():
-    """Free -- lists what's actually archived, so an agent can see what exists before
-    paying to search or export it. Cached for CACHE_TTL_SECONDS; see _cached's
-    comment for why."""
-    def _compute():
-        out = []
-        if ARCHIVE_DIR.exists():
-            for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
-                first_seq = last_seq = None
-                count = 0
-                for msg in _iter_messages(path):
-                    if first_seq is None:
-                        first_seq = msg.get("seq")
-                    last_seq = msg.get("seq")
-                    count += 1
-                out.append(
-                    {
-                        "room": path.stem,
-                        "archived_messages": count,
-                        "first_seq": first_seq,
-                        "last_seq": last_seq,
-                        "bytes": path.stat().st_size,
-                    }
-                )
-        return {"rooms": out}
-    return _cached("rooms", _compute)
+    """Free -- lists what's actually archived, so an agent can see what exists
+    before paying to search or export it. Served ONLY from the background-
+    refreshed cache (see _refresh_room_and_stats_caches) -- never computed
+    inline, so this can never itself time out at the gateway regardless of
+    how large the archive grows. 'warming_up' is true only in the brief window
+    right after a fresh boot, before the first background refresh completes."""
+    hit = _endpoint_cache.get("rooms")
+    if hit is None:
+        return {"rooms": [], "warming_up": True}
+    return hit[1]
 
 
 @app.get("/robots.txt")
@@ -1189,12 +1234,10 @@ def stats(room: str | None = None):
         if not path.exists():
             raise HTTPException(status_code=404, detail=f"no archive for room {room!r}")
         return _cached(f"stats:{room}", lambda: _room_stats(path))
-    if not ARCHIVE_DIR.exists():
-        return {"rooms": []}
-    return _cached(
-        "stats:_all_",
-        lambda: {"rooms": [_room_stats(p) for p in sorted(ARCHIVE_DIR.glob("*.jsonl"))]},
-    )
+    hit = _endpoint_cache.get("stats:_all_")
+    if hit is None:
+        return {"rooms": [], "warming_up": True}
+    return hit[1]
 
 
 # ----------------------------------------------------------- MCP tools -------
