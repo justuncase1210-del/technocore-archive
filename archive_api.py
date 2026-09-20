@@ -1623,4 +1623,14 @@ async def tclk_risk_check(body: dict = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # proxy_headers/forwarded_allow_ips: Akash's ingress terminates TLS and
+    # forwards plain HTTP internally, so without this uvicorn (and anything
+    # deriving a URL from the request, like x402's payment-challenge
+    # `resource.url`) sees the connection as http:// even though every real
+    # caller reached it over https://. "*" is used for forwarded_allow_ips
+    # because the ingress's internal IP isn't fixed/known -- safe here since
+    # this app has no IP-based access control depending on the real client IP.
+    uvicorn.run(
+        app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")),
+        proxy_headers=True, forwarded_allow_ips="*",
+    )
