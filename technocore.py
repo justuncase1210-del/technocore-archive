@@ -48,8 +48,11 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import random
 import re
+import signal
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -337,6 +340,123 @@ def cmd_watch(args):
         print(f"\nstopped. {written} messages archived this run, last seq {seq}", flush=True)
 
 
+def _watch_room_loop(room: str, out: str, wait: int, stop_event: threading.Event) -> None:
+    """Same long-poll/resume/append logic as cmd_watch, as a stoppable loop for use
+    from a worker thread (see cmd_watch_all). Kept separate from cmd_watch itself,
+    not refactored into it, so the single-room CLI command's already-tested behavior
+    is untouched by this."""
+    resume_from = _last_archived_seq(out)
+    print(f"[{room}] archiving -> {out}  (resuming from seq {resume_from})", flush=True)
+    seq = resume_from
+    written = 0
+    with open(out, "a", encoding="utf-8") as f:
+        while not stop_event.is_set():
+            qs = urllib.parse.urlencode(
+                {"since": seq, "wait": wait, "limit": 200, "format": "json"}
+            )
+            status, body = http_get(f"/r/{path_segment(room)}?{qs}")
+            if stop_event.is_set():
+                break
+            if status != 200:
+                print(f"[{room}] HTTP {status}: {body}", file=sys.stderr)
+                backoff = 65 + random.uniform(0, 10) if status == 429 else 5
+                stop_event.wait(backoff)
+                continue
+            try:
+                data = json.loads(body)
+            except ValueError:
+                print(f"[{room}] non-JSON response, skipping: {body[:200]!r}", file=sys.stderr)
+                stop_event.wait(5)
+                continue
+            new_this_poll = 0
+            for msg in data.get("messages", []):
+                if msg["seq"] <= seq:
+                    continue
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                seq = msg["seq"]
+                written += 1
+                new_this_poll += 1
+            if new_this_poll:
+                f.flush()
+                print(f"[{room}] +{new_this_poll} (total {written}), at seq {seq}", flush=True)
+    print(f"[{room}] stopped. {written} messages archived this run, last seq {seq}", flush=True)
+
+
+def cmd_watch_all(args):
+    """One process, one thread per room, instead of one OS process per room. Each
+    thread is >99% idle (blocked on the long-poll GET), so per-room cost is a thread
+    stack instead of a full interpreter + venv -- fixes 62 separate
+    `uv run technocore.py watch <room>` subprocesses eating ~1.8 GB of a 2 GB
+    container from per-process interpreter overhead alone, almost none of it doing
+    anything but waiting on a socket.
+
+    --rooms-file is re-read every --rescan-seconds so a newly-registered room can be
+    picked up without restarting this process and dropping every other room's
+    in-flight long-poll.
+    """
+    rooms_file = args.rooms_file
+    out_dir = args.out_dir.rstrip("/")
+    wait = args.wait
+    rescan = args.rescan_seconds
+
+    # Small stacks: each thread does one blocking urllib call and a handful of
+    # local variables, nothing deep or recursive -- 256 KiB instead of the 8 MiB
+    # default keeps N threads cheap. Must be set before any thread in this process
+    # starts; only affects threads created after the call.
+    try:
+        threading.stack_size(256 * 1024)
+    except (ValueError, RuntimeError) as e:
+        print(f"warning: could not set thread stack size: {e}", file=sys.stderr)
+
+    stop_event = threading.Event()
+
+    def _shutdown(signum, frame):
+        print(f"\nreceived signal {signum}, stopping all room threads...", flush=True)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    threads: dict[str, threading.Thread] = {}
+
+    def _read_rooms() -> list[str]:
+        try:
+            with open(rooms_file, encoding="utf-8") as f:
+                return [line.strip() for line in f
+                       if line.strip() and not line.startswith("#")]
+        except FileNotFoundError:
+            return []
+
+    def _start_room(room: str) -> None:
+        check_name("room", room)
+        out = f"{out_dir}/{room}.jsonl"
+        t = threading.Thread(
+            target=_watch_room_loop, args=(room, out, wait, stop_event),
+            name=f"watch-{room}", daemon=True,
+        )
+        threads[room] = t
+        t.start()
+
+    for room in _read_rooms():
+        _start_room(room)
+        stop_event.wait(0.5)
+    print(f"watch-all: started {len(threads)} room threads, "
+         f"rescanning {rooms_file} every {rescan}s", flush=True)
+
+    while not stop_event.is_set():
+        stop_event.wait(rescan)
+        for room in _read_rooms():
+            if room not in threads or not threads[room].is_alive():
+                if room in threads:
+                    print(f"[{room}] thread died, restarting", file=sys.stderr)
+                _start_room(room)
+                stop_event.wait(0.5)
+
+    for room, t in threads.items():
+        t.join(timeout=20)
+    print("watch-all: all room threads stopped", flush=True)
+
+
 def cmd_search(args):
     pattern = re.compile(args.pattern, re.IGNORECASE if args.i else 0)
     hits = 0
@@ -462,6 +582,19 @@ def main():
     sp.add_argument("--wait", type=int, default=25, help="long-poll seconds per request")
     sp.add_argument("--since", type=int, default=None, help="override auto-resume point")
     sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser(
+        "watch-all",
+        help="watch many rooms in ONE process (threads, not subprocesses) -- for "
+            "archiving dozens of rooms without one OS process per room",
+    )
+    sp.add_argument("--rooms-file", required=True,
+                    help="newline-separated room names, re-read every --rescan-seconds")
+    sp.add_argument("--out-dir", required=True, help="directory for <room>.jsonl files")
+    sp.add_argument("--wait", type=int, default=25, help="long-poll seconds per request")
+    sp.add_argument("--rescan-seconds", type=int, default=30,
+                    help="how often to re-read --rooms-file for new/removed rooms")
+    sp.set_defaults(func=cmd_watch_all)
 
     sp = sub.add_parser("search", help="search a JSONL archive from `watch`")
     sp.add_argument("file")
