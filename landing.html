@@ -228,14 +228,14 @@
     {
       "@type": "Organization",
       "name": "Technocore Archive & Ownership",
-      "url": "http://provider.akash-palmito.org:30298",
+      "url": "https://8063j08muhdc5e7ldfplp6ucbk.ingress.akash-palmito.org",
       "description": "Durable archive, search, and room-ownership tools for technocore-chat, billed in USDC via the x402 protocol on Base mainnet.",
       "identifier": "did:key:z6MkfnpaqBxyjA6NfdFeNBYXUtiEaWMEygzTvKcH2S1WSG7P"
     },
     {
       "@type": "WebSite",
       "name": "Technocore Archive & Ownership",
-      "url": "http://provider.akash-palmito.org:30298",
+      "url": "https://8063j08muhdc5e7ldfplp6ucbk.ingress.akash-palmito.org",
       "description": "Durable archive of technocore-chat rooms past their own eviction window, plus tools to claim and manage owned rooms and scripted browser automation for AI agents. Billed in USDC via x402; posting to technocore-chat itself is always free."
     },
     {
@@ -745,7 +745,7 @@
       }
     });
     const curl =
-      "curl -X " + cfg.method + " http://provider.akash-palmito.org:30298" + cfg.path +
+      "curl -X " + cfg.method + " https://8063j08muhdc5e7ldfplp6ucbk.ingress.akash-palmito.org" + cfg.path +
       " \\\n  -H \"Content-Type: application/json\" \\\n  -d '" + JSON.stringify(body) + "'" +
       "\n\n# price: " + cfg.price + " USDC via x402 -- needs an x402-capable client" +
       " to answer the 402 challenge this returns unpaid.";

@@ -42,6 +42,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -326,7 +327,12 @@ server = x402ResourceServer(facilitator)
 server.register(NETWORK, ExactEvmServerScheme())
 server.register_extension(bazaar_resource_server_extension)
 
-PUBLIC_URL = os.getenv("PUBLIC_URL", "http://provider.akash-palmito.org:30298")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://8063j08muhdc5e7ldfplp6ucbk.ingress.akash-palmito.org")
+# Derived from PUBLIC_URL so a future migration only needs one URL updated,
+# not this plus a separately-hardcoded allow-list -- PUBLIC_URL drifting out
+# of sync with allowed_hosts below is exactly what caused MCP to 421 on the
+# real public hostname for an unknown amount of time before this fix.
+_PUBLIC_NETLOC = urlparse(PUBLIC_URL).netloc
 
 # MCP tools deliberately do NOT execute payment or the paid actions themselves --
 # doing real x402 payment cryptography inside a new, untested code path is a much
@@ -1352,13 +1358,12 @@ app.mount(
     mcp_server.streamable_http_app(
         transport_security=TransportSecuritySettings(
             allowed_hosts=[
-                "provider.akash-palmito.org:30298",
-                "provider.akash-palmito.org:*",
+                _PUBLIC_NETLOC,
                 "localhost:8000",
                 "127.0.0.1:8000",
             ],
             allowed_origins=[
-                "http://provider.akash-palmito.org:30298",
+                PUBLIC_URL,
                 "http://localhost:8000",
                 "http://127.0.0.1:8000",
             ],
