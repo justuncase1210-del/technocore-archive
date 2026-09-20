@@ -264,6 +264,7 @@ export class X402Rail {
       const body = await res.text();
       throw new Error(`x402-rail: settlement relay refused: ${res.status} ${body}`);
     }
+    return res.json();
   }
 
   async refund(_ref) {
