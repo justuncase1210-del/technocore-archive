@@ -40,6 +40,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from contextlib import asynccontextmanager
@@ -816,57 +817,95 @@ def _cached(key: str, compute):
     return value
 
 
-def _compute_rooms() -> dict:
-    out = []
-    if ARCHIVE_DIR.exists():
-        for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
-            first_seq = last_seq = None
-            count = 0
-            for msg in _iter_messages(path):
-                if first_seq is None:
-                    first_seq = msg.get("seq")
-                last_seq = msg.get("seq")
-                count += 1
-            out.append(
-                {
-                    "room": path.stem,
-                    "archived_messages": count,
-                    "first_seq": first_seq,
-                    "last_seq": last_seq,
-                    "bytes": path.stat().st_size,
-                }
-            )
-    return {"rooms": out}
+# Running per-room totals for /rooms and /stats, advanced incrementally from a
+# byte offset. The previous version re-read every archive file twice (once for
+# each endpoint) on every 10-minute tick -- 2x the whole ~25GB archive per
+# tick on a single disk, which starved everything else doing I/O on the box.
+# Now only the first pass after a restart reads everything, and only once.
+_room_aggs: dict[str, dict] = {}
+_room_aggs_lock = threading.Lock()
 
 
-def _compute_stats_all() -> dict:
-    if not ARCHIVE_DIR.exists():
-        return {"rooms": []}
-    return {"rooms": [_room_stats(p) for p in sorted(ARCHIVE_DIR.glob("*.jsonl"))]}
+def _new_room_agg() -> dict:
+    return {"offset": 0, "count": 0, "signed": 0, "unsigned": 0, "dids": set(), "nicks": set(),
+            "total_len": 0, "first_ts": None, "last_ts": None, "first_seq": None, "last_seq": None}
+
+
+def _advance_room_agg(agg: dict, path: Path) -> None:
+    if path.stat().st_size < agg["offset"]:  # file replaced/shrunk -- start this room over
+        agg.clear()
+        agg.update(_new_room_agg())
+    offset = agg["offset"]
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break  # the live watcher's partial trailing write -- counted next pass
+            offset += len(raw)
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            agg["count"] += 1
+            text = msg.get("text", "")
+            agg["total_len"] += len(text)
+            frm = msg.get("from", "")
+            if frm.startswith("did:key:"):
+                agg["signed"] += 1
+                agg["dids"].add(frm)
+            else:
+                agg["unsigned"] += 1
+                agg["nicks"].add(frm)
+            ts, seq = msg.get("ts"), msg.get("seq")
+            if agg["first_ts"] is None:
+                agg["first_ts"] = ts
+            agg["last_ts"] = ts
+            if agg["first_seq"] is None:
+                agg["first_seq"] = seq
+            agg["last_seq"] = seq
+    agg["offset"] = offset
 
 
 def _refresh_room_and_stats_caches() -> None:
-    """Proactively recomputes the two full-archive-scan caches ('rooms' and
-    'stats:_all_') in the background, on the watchdog's own cadence -- never
-    inline in a request. Confirmed live (2026-09-20): once the ingress was
-    fixed to actually reach this port, /rooms and /stats immediately started
-    timing out (504) at the gateway on a cold cache, because lobby.jsonl alone
-    had grown to 7.5GB since the 12.5s/14.8s measurement this cache was
-    originally sized against. A lazy TTL cache still lets the first caller
-    after any restart eat that full scan live; only a caller-independent
-    background refresh actually removes the timeout risk, since no client-side
-    threading fixes a response that's simply too slow for the gateway's own
-    timeout. Per-room '/stats?room=X' is left on the original lazy _cached()
-    path -- a single room's file is far cheaper than scanning every room, and
-    a brand new room has no warm entry to serve until it's queried once anyway."""
+    """Background refresh for /rooms and /stats, never inline in a request (a
+    cold full scan runs past the gateway timeout -- lobby alone is ~8GB).
+    Incremental: see _room_aggs above. Skips if a previous pass is still
+    running, since the first full pass after a restart can outlast a tick."""
+    if not _room_aggs_lock.acquire(blocking=False):
+        return
     try:
-        _endpoint_cache["rooms"] = (time.time(), _compute_rooms())
+        rooms_out, stats_out = [], []
+        if ARCHIVE_DIR.exists():
+            for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
+                agg = _room_aggs.setdefault(path.stem, _new_room_agg())
+                try:
+                    _advance_room_agg(agg, path)
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                n = agg["count"]
+                rooms_out.append({"room": path.stem, "archived_messages": n, "first_seq": agg["first_seq"],
+                                  "last_seq": agg["last_seq"], "bytes": size})
+                stats_out.append({
+                    "room": path.stem,
+                    "archived_messages": n,
+                    "signed_messages": agg["signed"],
+                    "unsigned_messages": agg["unsigned"],
+                    "distinct_signers": len(agg["dids"]),
+                    "distinct_unsigned_nicks": len(agg["nicks"]),
+                    "avg_text_length": round(agg["total_len"] / n, 1) if n else 0,
+                    "first_ts": agg["first_ts"],
+                    "last_ts": agg["last_ts"],
+                    "first_seq": agg["first_seq"],
+                    "last_seq": agg["last_seq"],
+                })
+        now = time.time()
+        _endpoint_cache["rooms"] = (now, {"rooms": rooms_out})
+        _endpoint_cache["stats:_all_"] = (now, {"rooms": stats_out})
     except Exception:
-        pass
-    try:
-        _endpoint_cache["stats:_all_"] = (time.time(), _compute_stats_all())
-    except Exception:
-        pass
+        pass  # never let a bad pass kill the watchdog loop that calls this
+    finally:
+        _room_aggs_lock.release()
 
 
 @app.get("/rooms")

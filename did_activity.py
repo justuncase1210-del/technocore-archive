@@ -10,7 +10,7 @@ Build (incremental -- only reads bytes appended since the last run):
 
 archive_api.py imports this module for the query side only. The build always
 runs as its own detached process, never inside the API process: a first build
-is a full pass over every archive file (~20GB), same reason the tclk index
+is a full pass over every archive file (~25GB), same reason the tclk index
 rebuild is kept out-of-process.
 
 Only signed senders (did:key:...) are indexed -- unsigned nicks are
@@ -26,36 +26,56 @@ import math
 import re
 import sqlite3
 import sys
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-FP_CAP = 50              # distinct text fingerprints tracked per DID
+FP_CAP = 16              # distinct text fingerprints tracked per DID
+SAMPLE_CHARS = 120       # example text stored per repeated fingerprint
 CHECKPOINT_EVERY = 5000  # lines between seq->byte-offset checkpoints
-FLUSH_EVERY = 200_000    # lines between commits (bounds memory, crash-safe resume)
+FLUSH_EVERY = 200_000    # lines between commits (crash-safe resume points)
+# In-memory LRU sizes, kept across commits: the busiest senders are touched in
+# nearly every chunk, and re-reading their state from a multi-GB database on
+# every commit is what made the first version of this builder disk-bound.
+ROW_CACHE_MAX = 200_000
+FP_CACHE_MAX = 100_000
+ID_CACHE_MAX = 1_000_000
 MAX_SKIP_LINES = 100_000 # read_range() gives up past this many lines without reaching `since`
+
+# v2 storage layout. v1 repeated each ~56-byte DID string (and each room name)
+# in every row of every table, stored a text sample for every fingerprint, and
+# used rowid tables that kept composite keys twice -- it reached 6GB+ for the
+# first 7.6GB of archive on the live box and went disk-bound. v2 interns DIDs
+# and rooms as small integers, uses integer fingerprints, keeps samples only
+# for fingerprints that actually repeat, and stores the hour histogram
+# sparsely. A v1 file is dropped and rebuilt on first open (see _migrate).
+SCHEMA_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS room_progress(room TEXT PRIMARY KEY, offset INTEGER NOT NULL, last_seq INTEGER);
+CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY, room TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS dids(id INTEGER PRIMARY KEY, did TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS did_room(
-    did TEXT NOT NULL, room TEXT NOT NULL,
+    did_id INTEGER NOT NULL, room_id INTEGER NOT NULL,
     msg_count INTEGER NOT NULL, first_ts TEXT, last_ts TEXT,
     first_seq INTEGER, last_seq INTEGER, text_chars INTEGER NOT NULL,
     gap_n INTEGER NOT NULL, gap_mean REAL NOT NULL, gap_m2 REAL NOT NULL,
     last_epoch REAL, hours TEXT NOT NULL,
-    PRIMARY KEY(did, room));
-CREATE INDEX IF NOT EXISTS did_room_room_first ON did_room(room, first_ts);
-CREATE TABLE IF NOT EXISTS did_first(did TEXT PRIMARY KEY, first_ts TEXT NOT NULL, first_room TEXT NOT NULL);
+    PRIMARY KEY(did_id, room_id)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS did_room_room_first ON did_room(room_id, first_ts);
+CREATE TABLE IF NOT EXISTS did_first(did_id INTEGER PRIMARY KEY, first_ts TEXT NOT NULL, first_room_id INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS did_first_ts ON did_first(first_ts);
-CREATE TABLE IF NOT EXISTS did_fp(did TEXT NOT NULL, fp TEXT NOT NULL, count INTEGER NOT NULL, sample TEXT, PRIMARY KEY(did, fp));
-CREATE TABLE IF NOT EXISTS did_fp_overflow(did TEXT PRIMARY KEY, untracked_msgs INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS did_protocol(did TEXT PRIMARY KEY, msgs INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS seq_offsets(room TEXT NOT NULL, seq INTEGER NOT NULL, offset INTEGER NOT NULL, PRIMARY KEY(room, seq));
+CREATE TABLE IF NOT EXISTS did_fp(did_id INTEGER NOT NULL, fp INTEGER NOT NULL, count INTEGER NOT NULL, sample TEXT,
+    PRIMARY KEY(did_id, fp)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS did_extra(did_id INTEGER PRIMARY KEY, untracked_msgs INTEGER NOT NULL, protocol_msgs INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS seq_offsets(room_id INTEGER NOT NULL, seq INTEGER NOT NULL, offset INTEGER NOT NULL,
+    PRIMARY KEY(room_id, seq)) WITHOUT ROWID;
 """
-_DATA_TABLES = ("room_progress", "did_room", "did_first", "did_fp", "did_fp_overflow",
-                "did_protocol", "seq_offsets")
+_DATA_TABLES = ("room_progress", "rooms", "dids", "did_room", "did_first", "did_fp", "did_extra", "seq_offsets")
 
 _DIGIT_TOKEN_RE = re.compile(r"\b\w*\d\w*\b")
+_HEXISH_RE = re.compile(r"\b[0-9a-f]{6,}\b")
 _NON_WORD_RE = re.compile(r"[^\w#]+")
 # Structured protocol traffic (tclk frames and sonnet ballots are JSON; kibble
 # is "JOB v1 | ..." / "ATTEST v1 | ..."). It's templated by design, so it's
@@ -64,13 +84,14 @@ _NON_WORD_RE = re.compile(r"[^\w#]+")
 _PROTOCOL_RE = re.compile(r"^\s*(?:[\[{]|(?:JOB|DELIVER|RESULT|ATTEST)\s+v\d|tclk/)", re.IGNORECASE)
 
 
-def fingerprint(text: str) -> str:
-    """Template fingerprint: case-folded, any token containing a digit collapsed
-    to '#', punctuation dropped -- so "still around network running smooth!
-    [1a41f4]" and "... [9c02be]" (the filler-bot pattern seen live) collide."""
-    t = _DIGIT_TOKEN_RE.sub("#", (text or "").lower())
+def fingerprint(text: str) -> int:
+    """Template fingerprint: case-folded, any token containing a digit or
+    looking like a 6+ char hex id collapsed to '#', punctuation dropped -- so
+    "still around network running smooth! [1a41f4]" and "... [edccef]" (the
+    filler-bot pattern seen live) collide. Returns a 63-bit integer."""
+    t = _DIGIT_TOKEN_RE.sub("#", _HEXISH_RE.sub("#", (text or "").lower()))
     t = _NON_WORD_RE.sub(" ", t).strip()[:200]
-    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:16]
+    return int.from_bytes(hashlib.sha1(t.encode("utf-8")).digest()[:8], "big") >> 1
 
 
 def parse_ts(ts):
@@ -89,13 +110,44 @@ def parse_ts(ts):
     return dt.timestamp(), dt.strftime("%Y-%m-%dT%H:%M:%SZ"), dt.hour
 
 
+def _hours_encode(hours: list[int]) -> str:
+    return ",".join(f"{h}:{c}" for h, c in enumerate(hours) if c)
+
+
+def _hours_decode(s: str) -> list[int]:
+    hours = [0] * 24
+    for part in (s or "").split(","):
+        if part:
+            h, c = part.split(":")
+            hours[int(h)] = int(c)
+    return hours
+
+
 def connect_writer(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-262144")            # 256MB page cache (default is 2MB)
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA journal_size_limit=268435456")  # truncate the WAL back to <=256MB after checkpoints
+    _migrate(conn)
     conn.executescript(SCHEMA)
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+    conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    if not has_meta:
+        return
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row and row[0] == SCHEMA_VERSION:
+        return
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+    conn.commit()
 
 
 def connect_reader(db_path, timeout: float = 10) -> sqlite3.Connection:
@@ -113,48 +165,84 @@ class _NeedsFullRebuild(Exception):
 
 
 class _Builder:
+    """Keeps recently-touched state in LRU caches that survive across commits,
+    and only writes entries that actually changed. Row/fingerprint entries are
+    only evicted right after a commit, when every cached entry is clean, so
+    eviction never loses an unwritten change. (DID/room ids are immutable once
+    assigned, so their cache can evict at any time.)"""
+
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
-        self.rows: dict[tuple[str, str], dict] = {}
-        self.fps: dict[str, dict] = {}
-        self.first: dict[str, tuple[str, str]] = {}
-        self.offsets: list[tuple[str, int, int]] = []
+        self.did_ids: OrderedDict[str, int] = OrderedDict()
+        self.room_ids: dict[str, int] = {r["room"]: r["id"] for r in conn.execute("SELECT id, room FROM rooms")}
+        self.rows: OrderedDict[tuple[int, int], dict] = OrderedDict()
+        self.fps: OrderedDict[int, dict] = OrderedDict()
+        self.dirty_rows: set[tuple[int, int]] = set()
+        self.dirty_fps: set[int] = set()
+        self.first: dict[int, tuple[str, int]] = {}
+        self.offsets: list[tuple[int, int, int]] = []
 
-    def _row(self, did: str, room: str) -> dict:
-        key = (did, room)
+    def room_id(self, room: str) -> int:
+        i = self.room_ids.get(room)
+        if i is None:
+            i = self.conn.execute("INSERT INTO rooms(room) VALUES (?)", (room,)).lastrowid
+            self.room_ids[room] = i
+        return i
+
+    def _did_id(self, did: str) -> int:
+        i = self.did_ids.get(did)
+        if i is not None:
+            self.did_ids.move_to_end(did)
+            return i
+        row = self.conn.execute("SELECT id FROM dids WHERE did=?", (did,)).fetchone()
+        i = row[0] if row else self.conn.execute("INSERT INTO dids(did) VALUES (?)", (did,)).lastrowid
+        self.did_ids[did] = i
+        if len(self.did_ids) > ID_CACHE_MAX:
+            self.did_ids.popitem(last=False)
+        return i
+
+    def _row(self, did_id: int, room_id: int) -> dict:
+        key = (did_id, room_id)
         r = self.rows.get(key)
         if r is None:
-            got = self.conn.execute("SELECT * FROM did_room WHERE did=? AND room=?", key).fetchone()
+            got = self.conn.execute("SELECT * FROM did_room WHERE did_id=? AND room_id=?", key).fetchone()
             if got:
                 r = dict(got)
-                r["hours"] = json.loads(r["hours"])
+                r["hours"] = _hours_decode(r["hours"])
             else:
-                r = {"did": did, "room": room, "msg_count": 0, "first_ts": None, "last_ts": None,
+                r = {"did_id": did_id, "room_id": room_id, "msg_count": 0, "first_ts": None, "last_ts": None,
                      "first_seq": None, "last_seq": None, "text_chars": 0, "gap_n": 0,
                      "gap_mean": 0.0, "gap_m2": 0.0, "last_epoch": None, "hours": [0] * 24}
             self.rows[key] = r
+        else:
+            self.rows.move_to_end(key)
+        self.dirty_rows.add(key)
         return r
 
-    def _fp(self, did: str) -> dict:
-        f = self.fps.get(did)
+    def _fp(self, did_id: int) -> dict:
+        f = self.fps.get(did_id)
         if f is None:
             fp = {row["fp"]: [row["count"], row["sample"]]
-                  for row in self.conn.execute("SELECT fp, count, sample FROM did_fp WHERE did=?", (did,))}
-            ov = self.conn.execute("SELECT untracked_msgs FROM did_fp_overflow WHERE did=?", (did,)).fetchone()
-            pr = self.conn.execute("SELECT msgs FROM did_protocol WHERE did=?", (did,)).fetchone()
-            f = {"fp": fp, "overflow": ov[0] if ov else 0, "protocol": pr[0] if pr else 0}
-            self.fps[did] = f
+                  for row in self.conn.execute("SELECT fp, count, sample FROM did_fp WHERE did_id=?", (did_id,))}
+            ex = self.conn.execute("SELECT untracked_msgs, protocol_msgs FROM did_extra WHERE did_id=?",
+                                   (did_id,)).fetchone()
+            f = {"fp": fp, "overflow": ex[0] if ex else 0, "protocol": ex[1] if ex else 0}
+            self.fps[did_id] = f
+        else:
+            self.fps.move_to_end(did_id)
+        self.dirty_fps.add(did_id)
         return f
 
-    def add(self, room: str, msg: dict) -> None:
+    def add(self, room_id: int, msg: dict) -> None:
         frm = msg.get("from") or ""
         if not frm.startswith("did:key:"):
             return
+        did_id = self._did_id(frm)
         epoch, ts_norm, hour = parse_ts(msg.get("ts"))
         text = msg.get("text") or ""
         seq = msg.get("seq")
 
-        r = self._row(frm, room)
+        r = self._row(did_id, room_id)
         r["msg_count"] += 1
         r["text_chars"] += len(text)
         if ts_norm is not None:
@@ -163,9 +251,9 @@ class _Builder:
             if r["last_ts"] is None or ts_norm > r["last_ts"]:
                 r["last_ts"] = ts_norm
             r["hours"][hour] += 1
-            cur = self.first.get(frm)
+            cur = self.first.get(did_id)
             if cur is None or ts_norm < cur[0]:
-                self.first[frm] = (ts_norm, room)
+                self.first[did_id] = (ts_norm, room_id)
         if isinstance(seq, int):
             if r["first_seq"] is None:
                 r["first_seq"] = seq
@@ -179,7 +267,7 @@ class _Builder:
                 r["gap_m2"] += d * (gap - r["gap_mean"])
             r["last_epoch"] = epoch
 
-        f = self._fp(frm)
+        f = self._fp(did_id)
         if _PROTOCOL_RE.match(text):
             f["protocol"] += 1
             return
@@ -187,8 +275,10 @@ class _Builder:
         e = f["fp"].get(h)
         if e is not None:
             e[0] += 1
+            if e[1] is None:  # sample isn't persisted until a fingerprint repeats
+                e[1] = text[:SAMPLE_CHARS]
         elif len(f["fp"]) < FP_CAP:
-            f["fp"][h] = [1, text[:200]]
+            f["fp"][h] = [1, text[:SAMPLE_CHARS]]
         else:
             f["overflow"] += 1
 
@@ -196,25 +286,24 @@ class _Builder:
         c = self.conn
         c.executemany(
             "INSERT OR REPLACE INTO did_room VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(r["did"], r["room"], r["msg_count"], r["first_ts"], r["last_ts"], r["first_seq"],
+            [(r["did_id"], r["room_id"], r["msg_count"], r["first_ts"], r["last_ts"], r["first_seq"],
               r["last_seq"], r["text_chars"], r["gap_n"], r["gap_mean"], r["gap_m2"],
-              r["last_epoch"], json.dumps(r["hours"])) for r in self.rows.values()],
+              r["last_epoch"], _hours_encode(r["hours"]))
+             for r in (self.rows[k] for k in self.dirty_rows)],
         )
-        fp_rows, ov_rows, pr_rows = [], [], []
-        for did, f in self.fps.items():
-            fp_rows.extend((did, h, v[0], v[1]) for h, v in f["fp"].items())
-            if f["overflow"]:
-                ov_rows.append((did, f["overflow"]))
-            if f["protocol"]:
-                pr_rows.append((did, f["protocol"]))
+        fp_rows, ex_rows = [], []
+        for did_id in self.dirty_fps:
+            f = self.fps[did_id]
+            fp_rows.extend((did_id, h, v[0], v[1] if v[0] > 1 else None) for h, v in f["fp"].items())
+            if f["overflow"] or f["protocol"]:
+                ex_rows.append((did_id, f["overflow"], f["protocol"]))
         c.executemany("INSERT OR REPLACE INTO did_fp VALUES (?,?,?,?)", fp_rows)
-        c.executemany("INSERT OR REPLACE INTO did_fp_overflow VALUES (?,?)", ov_rows)
-        c.executemany("INSERT OR REPLACE INTO did_protocol VALUES (?,?)", pr_rows)
+        c.executemany("INSERT OR REPLACE INTO did_extra VALUES (?,?,?)", ex_rows)
         c.executemany(
-            "INSERT INTO did_first(did, first_ts, first_room) VALUES (?,?,?) "
-            "ON CONFLICT(did) DO UPDATE SET first_ts=excluded.first_ts, first_room=excluded.first_room "
+            "INSERT INTO did_first(did_id, first_ts, first_room_id) VALUES (?,?,?) "
+            "ON CONFLICT(did_id) DO UPDATE SET first_ts=excluded.first_ts, first_room_id=excluded.first_room_id "
             "WHERE excluded.first_ts < did_first.first_ts",
-            [(did, ts, rm) for did, (ts, rm) in self.first.items()],
+            [(did_id, ts, rid) for did_id, (ts, rid) in self.first.items()],
         )
         c.executemany("INSERT OR IGNORE INTO seq_offsets VALUES (?,?,?)", self.offsets)
         # Progress is committed in the same transaction as the data it covers,
@@ -227,10 +316,14 @@ class _Builder:
             (room, offset, last_seq),
         )
         c.commit()
-        self.rows.clear()
-        self.fps.clear()
+        self.dirty_rows.clear()
+        self.dirty_fps.clear()
         self.first.clear()
         self.offsets.clear()
+        while len(self.rows) > ROW_CACHE_MAX:  # everything is clean right after a commit
+            self.rows.popitem(last=False)
+        while len(self.fps) > FP_CACHE_MAX:
+            self.fps.popitem(last=False)
 
 
 def _process_room(b: _Builder, room: str, path: Path, start: int) -> int:
@@ -239,6 +332,7 @@ def _process_room(b: _Builder, room: str, path: Path, start: int) -> int:
         raise _NeedsFullRebuild(room)
     if size == start:
         return 0
+    room_id = b.room_id(room)
     added = pending = 0
     offset = start
     since_ckpt = CHECKPOINT_EVERY  # checkpoint the first line of every run
@@ -261,10 +355,10 @@ def _process_room(b: _Builder, room: str, path: Path, start: int) -> int:
             if isinstance(seq, int):
                 last_seq = seq
                 if since_ckpt >= CHECKPOINT_EVERY:
-                    b.offsets.append((room, seq, line_start))
+                    b.offsets.append((room_id, seq, line_start))
                     since_ckpt = 0
                 since_ckpt += 1
-            b.add(room, msg)
+            b.add(room_id, msg)
             added += 1
             pending += 1
             if pending >= FLUSH_EVERY:
@@ -337,6 +431,9 @@ def is_ready(db_path, timeout: float = 10) -> bool | None:
     try:
         conn = connect_reader(db_path, timeout)
         try:
+            ver = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if not ver or ver[0] != SCHEMA_VERSION:
+                return False  # an old-layout file the queries below can't read
             row = conn.execute("SELECT value FROM meta WHERE key='ready'").fetchone()
             return bool(row) and row[0] == "1"
         finally:
@@ -347,6 +444,16 @@ def is_ready(db_path, timeout: float = 10) -> bool | None:
 
 def generated_at(conn) -> str | None:
     row = conn.execute("SELECT value FROM meta WHERE key='generated_at'").fetchone()
+    return row[0] if row else None
+
+
+def _did_id_of(conn, did: str) -> int | None:
+    row = conn.execute("SELECT id FROM dids WHERE did=?", (did,)).fetchone()
+    return row[0] if row else None
+
+
+def _room_id_of(conn, room: str) -> int | None:
+    row = conn.execute("SELECT id FROM rooms WHERE room=?", (room,)).fetchone()
     return row[0] if row else None
 
 
@@ -369,14 +476,19 @@ def _epoch(ts_norm: str) -> float:
 
 
 def profile(conn, did: str) -> dict | None:
-    rows = conn.execute("SELECT * FROM did_room WHERE did=?", (did,)).fetchall()
+    did_id = _did_id_of(conn, did)
+    if did_id is None:
+        return None
+    rows = conn.execute(
+        "SELECT d.*, r.room AS room FROM did_room d JOIN rooms r ON r.id = d.room_id "
+        "WHERE d.did_id=? ORDER BY r.room", (did_id,)).fetchall()
     if not rows:
         return None
     total = sum(r["msg_count"] for r in rows)
     chars = sum(r["text_chars"] for r in rows)
     hours = [0] * 24
     for r in rows:
-        for i, c in enumerate(json.loads(r["hours"])):
+        for i, c in enumerate(_hours_decode(r["hours"])):
             hours[i] += c
     n, mean, m2 = _merge_gaps(rows)
     stdev = math.sqrt(m2 / n) if n > 1 else None
@@ -389,7 +501,7 @@ def profile(conn, did: str) -> dict | None:
         ({"room": r["room"], "messages": r["msg_count"], "first_ts": r["first_ts"],
           "last_ts": r["last_ts"], "first_seq": r["first_seq"], "last_seq": r["last_seq"]}
          for r in rows),
-        key=lambda x: -x["messages"],
+        key=lambda x: (-x["messages"], x["room"]),
     )
     return {
         "messages": total,
@@ -418,11 +530,12 @@ def bot_check(conn, did: str) -> dict | None:
     p = profile(conn, did)
     if p is None:
         return None
-    fps = conn.execute("SELECT count, sample FROM did_fp WHERE did=? ORDER BY count DESC", (did,)).fetchall()
-    ov = conn.execute("SELECT untracked_msgs FROM did_fp_overflow WHERE did=?", (did,)).fetchone()
-    pr = conn.execute("SELECT msgs FROM did_protocol WHERE did=?", (did,)).fetchone()
-    untracked = ov[0] if ov else 0
-    protocol_msgs = pr[0] if pr else 0
+    did_id = _did_id_of(conn, did)
+    fps = conn.execute("SELECT count, sample FROM did_fp WHERE did_id=? ORDER BY count DESC, fp",
+                       (did_id,)).fetchall()
+    ex = conn.execute("SELECT untracked_msgs, protocol_msgs FROM did_extra WHERE did_id=?", (did_id,)).fetchone()
+    untracked = ex[0] if ex else 0
+    protocol_msgs = ex[1] if ex else 0
     tracked = sum(r["count"] for r in fps)
     total = tracked + untracked  # natural-language messages only
     repeat_ratio = (tracked - len(fps)) / total if total else 0.0
@@ -486,11 +599,13 @@ def identity_rate(conn, since: str, until: str, bucket: str = "day", room: str |
     normalized 'YYYY-MM-DDTHH:MM:SSZ' strings, until exclusive."""
     width = 13 if bucket == "hour" else 10
     if room:
+        room_id = _room_id_of(conn, room)
         rows = conn.execute(
             f"SELECT substr(first_ts,1,{width}) AS b, COUNT(*) AS n FROM did_room "
-            "WHERE room=? AND first_ts>=? AND first_ts<? GROUP BY b", (room, since, until)).fetchall()
-        prior = conn.execute("SELECT COUNT(*) FROM did_room WHERE room=? AND first_ts<?", (room, since)).fetchone()[0]
-        coverage = conn.execute("SELECT MIN(first_ts) FROM did_room WHERE room=?", (room,)).fetchone()[0]
+            "WHERE room_id=? AND first_ts>=? AND first_ts<? GROUP BY b", (room_id, since, until)).fetchall()
+        prior = conn.execute("SELECT COUNT(*) FROM did_room WHERE room_id=? AND first_ts<?",
+                             (room_id, since)).fetchone()[0]
+        coverage = conn.execute("SELECT MIN(first_ts) FROM did_room WHERE room_id=?", (room_id,)).fetchone()[0]
     else:
         rows = conn.execute(
             f"SELECT substr(first_ts,1,{width}) AS b, COUNT(*) AS n FROM did_first "
@@ -539,9 +654,12 @@ def _ts_shift(ts_norm: str, days: int) -> str:
 
 
 def find_offset(conn, room: str, seq: int) -> int:
+    room_id = _room_id_of(conn, room)
+    if room_id is None:
+        return 0
     row = conn.execute(
-        "SELECT offset FROM seq_offsets WHERE room=? AND seq<=? ORDER BY seq DESC LIMIT 1",
-        (room, seq)).fetchone()
+        "SELECT offset FROM seq_offsets WHERE room_id=? AND seq<=? ORDER BY seq DESC LIMIT 1",
+        (room_id, seq)).fetchone()
     return row[0] if row else 0
 
 
