@@ -37,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -637,6 +638,99 @@ def _iter_messages(path: Path):
                 continue
 
 
+# Paid scans stop here and return what they have (flagged truncated) rather
+# than run past the ingress's gateway timeout -- x402 has already settled by
+# the time a handler runs, so a 504 means the caller paid for nothing.
+SCAN_BUDGET_SECONDS = 25.0
+
+
+class _ScanBudgetExceeded(Exception):
+    def __init__(self, last_seq: int):
+        self.last_seq = last_seq
+
+
+def _iter_messages_from(path: Path, offset: int = 0):
+    """_iter_messages, starting at a byte offset (a line start recorded by the
+    activity index) instead of the top of the file."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for raw in f:
+            try:
+                yield json.loads(raw)
+            except ValueError:
+                continue
+
+
+def _index_offset(room: str, seq: int) -> int:
+    if seq <= 0 or not DID_INDEX_DB.exists():
+        return 0
+    try:
+        conn = did_activity.connect_reader(DID_INDEX_DB)
+        try:
+            return did_activity.find_offset(conn, room, seq)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _messages_after(room: str, path: Path, since: int, deadline: float | None = None):
+    """Messages with seq > since. Seeks to the activity index's nearest
+    checkpoint at or before `since` instead of reading a multi-GB file from the
+    top -- milliseconds instead of a gateway timeout on lobby. Falls back to a
+    full read when there's no checkpoint yet (index still building, or a room
+    registered since the last index run). Raises _ScanBudgetExceeded once
+    `deadline` (time.monotonic()) passes."""
+    offset = _index_offset(room, since)
+    last = since
+    for start in ((offset, 0) if offset else (0,)):
+        stale = False
+        first = True
+        for msg in _iter_messages_from(path, start):
+            seq = msg.get("seq")
+            if not isinstance(seq, int):
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                raise _ScanBudgetExceeded(max(last, since))
+            last = seq
+            if first:
+                first = False
+                if start and seq > since:
+                    # A checkpoint's own line is always at or before `since`;
+                    # landing past it means the file was rewritten after it was
+                    # indexed, so the offset can't be trusted.
+                    stale = True
+                    break
+            if seq > since:
+                yield msg
+        # A valid checkpoint always has its own line at its offset, so reading
+        # nothing at all from a non-zero offset (e.g. the file was rewritten
+        # shorter than it) also means the index is stale.
+        if start and first:
+            stale = True
+        if not stale:
+            return
+
+
+def _iter_lines_reverse(path: Path, block: int = 1 << 20):
+    """Raw lines from the end of the file backwards."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        tail = b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            parts = (f.read(step) + tail).split(b"\n")
+            tail = parts[0]  # may continue into the previous block
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line
+        if tail:
+            yield tail
+
+
 ATTEST_RE = re.compile(r"^ATTEST\s+v1\s*\|\s*(\S+)\s*\|\s*(useful|not)\s*\|\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
@@ -857,6 +951,9 @@ async def archive_search(body: dict = None):
     limit = body.get("limit", 50)
     if not isinstance(limit, int) or limit < 1 or limit > MAX_RESULTS:
         raise HTTPException(status_code=400, detail=f"limit must be an integer 1-{MAX_RESULTS}")
+    since = body.get("since", 0)
+    if not isinstance(since, int) or since < 0:
+        raise HTTPException(status_code=400, detail="'since' must be a non-negative integer seq")
 
     path = _archive_path(room)
     try:
@@ -864,13 +961,32 @@ async def archive_search(body: dict = None):
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"invalid regex: {e}")
 
-    results = []
-    for msg in _iter_messages(path):
-        if regex.search(msg.get("text", "")):
-            results.append(msg)
-            if len(results) >= limit:
-                break
-    return {"room": room, "pattern": pattern, "count": len(results), "results": results}
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS  # includes any wait for the semaphore
+    async with _HEAVY_SCAN_SEMAPHORE:
+        results, last_seq, truncated = await asyncio.to_thread(
+            _archive_search_scan, room, path, regex, limit, since, deadline
+        )
+    out = {"room": room, "pattern": pattern, "since": since, "count": len(results), "results": results,
+           "truncated": truncated, "scanned_through_seq": last_seq}
+    if truncated:
+        out["resume_since"] = last_seq
+        out["note"] = (f"stopped at this endpoint's {int(SCAN_BUDGET_SECONDS)}s scan budget -- call again "
+                       "with since=resume_since to continue from where this left off")
+    return out
+
+
+def _archive_search_scan(room, path, regex, limit, since, deadline):
+    results, last_seq = [], since
+    try:
+        for msg in _messages_after(room, path, since, deadline):
+            last_seq = msg["seq"]
+            if regex.search(msg.get("text", "")):
+                results.append(msg)
+                if len(results) >= limit:
+                    break
+    except _ScanBudgetExceeded as e:
+        return results, max(last_seq, e.last_seq), True
+    return results, last_seq, False
 
 
 @app.post("/api/v1/archive/register")
@@ -927,13 +1043,40 @@ async def archive_export(body: dict = None):
         raise HTTPException(status_code=400, detail=f"limit must be an integer 1-{MAX_RESULTS}")
 
     path = _archive_path(room)
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+    results, truncated = await asyncio.to_thread(_archive_export_scan, room, path, since, limit, deadline)
+    out = {"room": room, "since": since, "count": len(results), "results": results, "truncated": truncated}
+    if truncated:
+        out["note"] = (
+            f"stopped at this endpoint's {int(SCAN_BUDGET_SECONDS)}s scan budget -- call again with since "
+            "set to the last seq returned (or the same since, if none were). This only happens before "
+            "the archive's seq index has caught up to this room."
+        )
+    return out
+
+
+def _archive_export_scan(room, path, since, limit, deadline):
     results = []
-    for msg in _iter_messages(path):
-        if msg.get("seq", 0) > since:
+    try:
+        for msg in _messages_after(room, path, since, deadline):
             results.append(msg)
             if len(results) >= limit:
                 break
-    return {"room": room, "since": since, "count": len(results), "results": results}
+    except _ScanBudgetExceeded:
+        return results, True
+    return results, False
+
+
+def _archive_verify_scan(room, path, seq, deadline):
+    """(message or None, scan_complete). Seqs are written in increasing order,
+    so the first message past seq-1 either is `seq` or proves it isn't here --
+    no need to read to the end of the file."""
+    try:
+        for msg in _messages_after(room, path, seq - 1, deadline):
+            return (msg, True) if msg["seq"] == seq else (None, True)
+    except _ScanBudgetExceeded:
+        return None, False
+    return None, True
 
 
 @app.post("/api/v1/archive/verify")
@@ -950,15 +1093,27 @@ async def archive_verify(body: dict = None):
         raise HTTPException(status_code=400, detail="'claimed_text' must be a string if provided")
 
     path = _archive_path(room)  # 404s if this room isn't archived at all
-    for msg in _iter_messages(path):
-        if msg.get("seq") == seq:
-            return {
-                "room": room,
-                "seq": seq,
-                "found": True,
-                "message": msg,
-                "text_matches": (msg.get("text") == claimed_text) if claimed_text is not None else None,
-            }
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+    msg, complete = await asyncio.to_thread(_archive_verify_scan, room, path, seq, deadline)
+    if msg is not None:
+        return {
+            "room": room,
+            "seq": seq,
+            "found": True,
+            "message": msg,
+            "text_matches": (msg.get("text") == claimed_text) if claimed_text is not None else None,
+        }
+    if not complete:
+        return {
+            "room": room,
+            "seq": seq,
+            "found": None,
+            "text_matches": None,
+            "scan_complete": False,
+            "note": f"undetermined: the {int(SCAN_BUDGET_SECONDS)}s scan budget ran out before reaching this "
+            "seq, so this is neither a found nor a not-found result. This only happens before the "
+            "archive's seq index has caught up to this room -- retry shortly.",
+        }
     return {
         "room": room,
         "seq": seq,
@@ -980,20 +1135,24 @@ async def archive_verify(body: dict = None):
 _HEAVY_SCAN_SEMAPHORE = asyncio.Semaphore(2)
 
 
-def _archive_search_all_scan(regex, limit):
+def _archive_search_all_scan(regex, limit, deadline):
+    """Returns (rooms_searched, results, stopped_in_room). stopped_in_room is
+    set only when the scan budget ran out partway through that room."""
     results = []
     rooms_searched = []
     if ARCHIVE_DIR.exists():
         for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
-            rooms_searched.append(path.stem)
             for msg in _iter_messages(path):
+                if time.monotonic() > deadline:
+                    return rooms_searched, results, path.stem
                 if regex.search(msg.get("text", "")):
                     results.append({**msg, "room": path.stem})
                     if len(results) >= limit:
                         break
+            rooms_searched.append(path.stem)
             if len(results) >= limit:
                 break
-    return rooms_searched, results
+    return rooms_searched, results, None
 
 
 @app.post("/api/v1/archive/search-all")
@@ -1012,15 +1171,27 @@ async def archive_search_all(body: dict = None):
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"invalid regex: {e}")
 
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
     async with _HEAVY_SCAN_SEMAPHORE:
-        rooms_searched, results = await asyncio.to_thread(_archive_search_all_scan, regex, limit)
+        rooms_searched, results, stopped_in = await asyncio.to_thread(
+            _archive_search_all_scan, regex, limit, deadline
+        )
 
-    return {
+    out = {
         "pattern": pattern,
         "rooms_searched": rooms_searched,
         "count": len(results),
         "results": results,
+        "truncated": stopped_in is not None,
     }
+    if stopped_in is not None:
+        out["stopped_in_room"] = stopped_in
+        out["note"] = (
+            f"stopped at this endpoint's {int(SCAN_BUDGET_SECONDS)}s scan budget partway through "
+            f"'{stopped_in}'; rooms after it weren't searched. For the rest, use "
+            "POST /api/v1/archive/search per room, which can resume with 'since'."
+        )
+    return out
 
 
 import ipaddress
@@ -1145,31 +1316,44 @@ def _resolve_node() -> str | None:
 CONTRACT_RE = re.compile(r"^0x[0-9a-f]{64}$")
 
 
-def _find_tclk_accept_and_offer(contract: str) -> tuple[dict | None, dict | None]:
-    """Scan our local tclk-offers archive for the accept frame that produced `contract`
-    and the offer frame it references. Either or both may come back None."""
+TCLK_ARCHIVE_SCAN_BUDGET_SECONDS = 15.0  # leaves room for the live fetch + node audit below
+
+
+def _find_tclk_accept_and_offer(contract: str, deadline: float) -> tuple[dict | None, dict | None, bool]:
+    """Scan our local tclk-offers archive for the accept frame that produced
+    `contract` and the offer frame it references: (offer, accept, scan_complete).
+
+    Reads backwards from the end in one pass. The offer always precedes its
+    accept, and audits are overwhelmingly about recent deals, so this usually
+    stops within the file's last few MB -- the old two forward passes read up
+    to 3GB+ each and ran past the gateway timeout for any recent contract."""
     offers_path = ARCHIVE_DIR / "tclk-offers.jsonl"
     if not offers_path.exists():
-        return None, None
-    accept_msg = None
-    offer_ref = None
-    for msg in _iter_messages(offers_path):
+        return None, None, True
+    accept_msg = offer_msg = offer_ref = None
+    needle = contract.encode()
+    for raw in _iter_lines_reverse(offers_path):
+        if time.monotonic() > deadline:
+            return offer_msg, accept_msg, False
+        target = needle if accept_msg is None else offer_ref.encode()
+        if target not in raw:  # cheap byte prefilter before any JSON parsing
+            continue
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
         text = msg.get("text", "")
-        if f'"contract":"{contract}"' in text and '"type":"accept"' in text:
-            accept_msg = msg
-            m = re.search(r'"ref":"(0x[0-9a-f]+)"', text)
-            if m:
+        if accept_msg is None:
+            if f'"contract":"{contract}"' in text and '"type":"accept"' in text:
+                accept_msg = msg
+                m = re.search(r'"ref":"(0x[0-9a-f]+)"', text)
+                if not m:
+                    return None, accept_msg, True
                 offer_ref = m.group(1)
-            break
-    if offer_ref is None:
-        return None, accept_msg
-    offer_msg = None
-    for msg in _iter_messages(offers_path):
-        text = msg.get("text", "")
-        if f'"id":"{offer_ref}"' in text and '"type":"offer"' in text:
+        elif f'"id":"{offer_ref}"' in text and '"type":"offer"' in text:
             offer_msg = msg
             break
-    return offer_msg, accept_msg
+    return offer_msg, accept_msg, True
 
 
 @app.post("/api/v1/tclk/audit")
@@ -1178,8 +1362,13 @@ async def tclk_audit(body: dict = None):
     contract = body.get("contract")
     if not isinstance(contract, str) or not CONTRACT_RE.fullmatch(contract):
         raise HTTPException(status_code=400, detail="Missing or invalid 'contract' -- must be 0x + 64 hex chars")
+    # Archive scan plus two subprocess calls, all blocking -- keep them off the event loop.
+    return await asyncio.to_thread(_tclk_audit_sync, contract)
 
-    offer_msg, accept_msg = _find_tclk_accept_and_offer(contract)
+
+def _tclk_audit_sync(contract: str) -> dict:
+    deadline = time.monotonic() + TCLK_ARCHIVE_SCAN_BUDGET_SECONDS
+    offer_msg, accept_msg, archive_scan_complete = _find_tclk_accept_and_offer(contract, deadline)
     lines = []
     if offer_msg:
         lines.append(json.dumps({**offer_msg, "_room": "tclk-offers"}))
@@ -1218,7 +1407,10 @@ async def tclk_audit(body: dict = None):
     if not lines:
         raise HTTPException(
             status_code=404,
-            detail=f"no records found for contract {contract} in our tclk-offers archive or the live deal room",
+            detail=f"no records found for contract {contract} in our tclk-offers archive or the live deal room"
+            + ("" if archive_scan_complete else
+               " (the archive scan hit its time budget before reaching the start of the file, so a very "
+               "old contract may be further back than this call could read)"),
         )
 
     node_bin = _resolve_node()
@@ -1240,6 +1432,12 @@ async def tclk_audit(body: dict = None):
         raise HTTPException(status_code=502, detail=f"audit script failed: {(result.stderr or result.stdout)[-500:]}")
 
     verdict["deal_room_fetch_status"] = deal_room_status
+    verdict["archive_scan_complete"] = archive_scan_complete
+    if not archive_scan_complete and offer_msg is None:
+        verdict["archive_note"] = (
+            "the durable-archive scan hit its time budget before finding this deal's offer frame; "
+            "the audit covers what was found plus the live deal room."
+        )
     if deal_room_status not in (200, None):
         verdict["note"] = (
             "live deal-room fetch did not succeed (see deal_room_fetch_status) -- this audit "
@@ -1353,6 +1551,13 @@ def stats(room: str | None = None):
         path = ARCHIVE_DIR / f"{room}.jsonl"
         if not path.exists():
             raise HTTPException(status_code=404, detail=f"no archive for room {room!r}")
+        # The background-refreshed aggregate already holds every room's stats --
+        # serve from it rather than a cold per-room scan (minutes on lobby).
+        hit = _endpoint_cache.get("stats:_all_")
+        if hit is not None:
+            for entry in hit[1].get("rooms", []):
+                if entry.get("room") == room:
+                    return entry
         return _cached(f"stats:{room}", lambda: _room_stats(path))
     hit = _endpoint_cache.get("stats:_all_")
     if hit is None:
@@ -1506,6 +1711,21 @@ async def votes_standings(body: dict = None):
             detail=f"room '{room}' is not archived yet -- register it first via POST /api/v1/archive/register",
         )
 
+    async with _HEAVY_SCAN_SEMAPHORE:
+        (raw_tally, first_ballot, last_ballot, ballot_count_by_voter, first_seen_in_room,
+         total_ballots, malformed) = await asyncio.to_thread(_votes_standings_scan, path, contest_id)
+
+    if total_ballots == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="no sonnet.ballot.v1 records found in this room"
+            + (f" for contest_id={contest_id!r}" if contest_id else ""),
+        )
+    return _votes_standings_result(room, contest_id, raw_tally, first_ballot, last_ballot,
+                                   ballot_count_by_voter, first_seen_in_room, total_ballots, malformed)
+
+
+def _votes_standings_scan(path, contest_id):
     raw_tally = collections.Counter()
     first_ballot: dict[str, dict] = {}
     last_ballot: dict[str, dict] = {}
@@ -1540,13 +1760,12 @@ async def votes_standings(body: dict = None):
         first_ballot.setdefault(voter, rec)
         last_ballot[voter] = rec
 
-    if total_ballots == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="no sonnet.ballot.v1 records found in this room"
-            + (f" for contest_id={contest_id!r}" if contest_id else ""),
-        )
+    return (raw_tally, first_ballot, last_ballot, ballot_count_by_voter, first_seen_in_room,
+            total_ballots, malformed)
 
+
+def _votes_standings_result(room, contest_id, raw_tally, first_ballot, last_ballot,
+                            ballot_count_by_voter, first_seen_in_room, total_ballots, malformed):
     dedup_first_tally = collections.Counter(b["entry_id"] for b in first_ballot.values())
     dedup_last_tally = collections.Counter(b["entry_id"] for b in last_ballot.values())
 
@@ -1691,6 +1910,18 @@ async def kibble_attestor_check(body: dict = None):
     return result
 
 
+_tclk_index_cache: dict = {"mtime": None, "data": None}
+
+
+def _load_tclk_did_index(path: Path) -> dict:
+    mtime = path.stat().st_mtime
+    if _tclk_index_cache["mtime"] != mtime:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        _tclk_index_cache.update(mtime=mtime, data=data)
+    return _tclk_index_cache["data"]
+
+
 @app.post("/api/v1/tclk/risk-check")
 async def tclk_risk_check(body: dict = None):
     body = body or {}
@@ -1702,8 +1933,7 @@ async def tclk_risk_check(body: dict = None):
     if not index_path.exists():
         raise HTTPException(status_code=503, detail="risk-check index not built yet -- try again shortly")
 
-    with open(index_path, encoding="utf-8") as f:
-        index = json.load(f)
+    index = await asyncio.to_thread(_load_tclk_did_index, index_path)
 
     entry = index.get("dids", {}).get(did)
     generated_at = index.get("generated_at")
