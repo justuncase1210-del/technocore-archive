@@ -49,7 +49,13 @@ MAX_SKIP_LINES = 100_000 # read_range() gives up past this many lines without re
 # and rooms as small integers, uses integer fingerprints, keeps samples only
 # for fingerprints that actually repeat, and stores the hour histogram
 # sparsely. A v1 file is dropped and rebuilt on first open (see _migrate).
-SCHEMA_VERSION = "2"
+# v3 adds a per-DID HyperLogLog (did_extra.hll) for distinct-template counts
+# past FP_CAP. v2 counted everything beyond the first 16 tracked templates as
+# unique, so a bot rotating through dozens of lines (the live filler bot:
+# ~70 trivia lines, 305k messages) read as 22% repetitive instead of ~99.9%.
+SCHEMA_VERSION = "3"
+HLL_P = 8                 # 256 one-byte registers per overflowing DID, ~6.5% standard error
+HLL_M = 1 << HLL_P
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -68,7 +74,7 @@ CREATE TABLE IF NOT EXISTS did_first(did_id INTEGER PRIMARY KEY, first_ts TEXT N
 CREATE INDEX IF NOT EXISTS did_first_ts ON did_first(first_ts);
 CREATE TABLE IF NOT EXISTS did_fp(did_id INTEGER NOT NULL, fp INTEGER NOT NULL, count INTEGER NOT NULL, sample TEXT,
     PRIMARY KEY(did_id, fp)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS did_extra(did_id INTEGER PRIMARY KEY, untracked_msgs INTEGER NOT NULL, protocol_msgs INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS did_extra(did_id INTEGER PRIMARY KEY, untracked_msgs INTEGER NOT NULL, protocol_msgs INTEGER NOT NULL, hll BLOB);
 CREATE TABLE IF NOT EXISTS seq_offsets(room_id INTEGER NOT NULL, seq INTEGER NOT NULL, offset INTEGER NOT NULL,
     PRIMARY KEY(room_id, seq)) WITHOUT ROWID;
 """
@@ -108,6 +114,24 @@ def parse_ts(ts):
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
     return dt.timestamp(), dt.strftime("%Y-%m-%dT%H:%M:%SZ"), dt.hour
+
+
+def _hll_add(reg: bytearray, h: int) -> None:
+    """h is a 63-bit fingerprint (uniform: sha1-derived)."""
+    rest_bits = 63 - HLL_P
+    idx = h >> rest_bits
+    rank = rest_bits - (h & ((1 << rest_bits) - 1)).bit_length() + 1
+    if rank > reg[idx]:
+        reg[idx] = rank
+
+
+def hll_count(reg) -> float:
+    alpha = 0.7213 / (1 + 1.079 / HLL_M)
+    est = alpha * HLL_M * HLL_M / sum(2.0 ** -r for r in reg)
+    zeros = reg.count(0)
+    if est <= 2.5 * HLL_M and zeros:
+        est = HLL_M * math.log(HLL_M / zeros)  # linear counting: exact-ish for small cardinalities
+    return est
 
 
 def _hours_encode(hours: list[int]) -> str:
@@ -224,9 +248,10 @@ class _Builder:
         if f is None:
             fp = {row["fp"]: [row["count"], row["sample"]]
                   for row in self.conn.execute("SELECT fp, count, sample FROM did_fp WHERE did_id=?", (did_id,))}
-            ex = self.conn.execute("SELECT untracked_msgs, protocol_msgs FROM did_extra WHERE did_id=?",
+            ex = self.conn.execute("SELECT untracked_msgs, protocol_msgs, hll FROM did_extra WHERE did_id=?",
                                    (did_id,)).fetchone()
-            f = {"fp": fp, "overflow": ex[0] if ex else 0, "protocol": ex[1] if ex else 0}
+            f = {"fp": fp, "overflow": ex[0] if ex else 0, "protocol": ex[1] if ex else 0,
+                 "hll": bytearray(ex[2]) if ex and ex[2] is not None else None}
             self.fps[did_id] = f
         else:
             self.fps.move_to_end(did_id)
@@ -281,6 +306,14 @@ class _Builder:
             f["fp"][h] = [1, text[:SAMPLE_CHARS]]
         else:
             f["overflow"] += 1
+            if f["hll"] is None:
+                # First overflow: from here on, distinct templates are counted
+                # approximately -- seed with the exactly-tracked ones.
+                f["hll"] = bytearray(HLL_M)
+                for tracked in f["fp"]:
+                    _hll_add(f["hll"], tracked)
+        if f["hll"] is not None:
+            _hll_add(f["hll"], h)
 
     def flush(self, room: str, offset: int, last_seq) -> None:
         c = self.conn
@@ -295,10 +328,11 @@ class _Builder:
         for did_id in self.dirty_fps:
             f = self.fps[did_id]
             fp_rows.extend((did_id, h, v[0], v[1] if v[0] > 1 else None) for h, v in f["fp"].items())
-            if f["overflow"] or f["protocol"]:
-                ex_rows.append((did_id, f["overflow"], f["protocol"]))
+            if f["overflow"] or f["protocol"] or f["hll"] is not None:
+                ex_rows.append((did_id, f["overflow"], f["protocol"],
+                                bytes(f["hll"]) if f["hll"] is not None else None))
         c.executemany("INSERT OR REPLACE INTO did_fp VALUES (?,?,?,?)", fp_rows)
-        c.executemany("INSERT OR REPLACE INTO did_extra VALUES (?,?,?)", ex_rows)
+        c.executemany("INSERT OR REPLACE INTO did_extra VALUES (?,?,?,?)", ex_rows)
         c.executemany(
             "INSERT INTO did_first(did_id, first_ts, first_room_id) VALUES (?,?,?) "
             "ON CONFLICT(did_id) DO UPDATE SET first_ts=excluded.first_ts, first_room_id=excluded.first_room_id "
@@ -533,12 +567,17 @@ def bot_check(conn, did: str) -> dict | None:
     did_id = _did_id_of(conn, did)
     fps = conn.execute("SELECT count, sample FROM did_fp WHERE did_id=? ORDER BY count DESC, fp",
                        (did_id,)).fetchall()
-    ex = conn.execute("SELECT untracked_msgs, protocol_msgs FROM did_extra WHERE did_id=?", (did_id,)).fetchone()
+    ex = conn.execute("SELECT untracked_msgs, protocol_msgs, hll FROM did_extra WHERE did_id=?",
+                      (did_id,)).fetchone()
     untracked = ex[0] if ex else 0
     protocol_msgs = ex[1] if ex else 0
+    hll = ex[2] if ex else None
     tracked = sum(r["count"] for r in fps)
     total = tracked + untracked  # natural-language messages only
-    repeat_ratio = (tracked - len(fps)) / total if total else 0.0
+    # Exact when nothing overflowed the tracked set; otherwise a HyperLogLog
+    # estimate of distinct templates across every message, not just the first 16.
+    distinct = len(fps) if hll is None else max(len(fps), min(total, round(hll_count(hll))))
+    repeat_ratio = max(0.0, (total - distinct) / total) if total else 0.0
     top = [{"count": r["count"], "share": round(r["count"] / total, 3), "sample": (r["sample"] or "")[:160]}
            for r in fps[:5]] if total else []
 
@@ -576,7 +615,9 @@ def bot_check(conn, did: str) -> dict | None:
         "signals": {
             "template_repetition": {
                 "repeat_ratio": round(repeat_ratio, 3),
-                "distinct_templates_tracked": len(fps),
+                "distinct_templates": distinct,
+                "distinct_templates_is_estimate": hll is not None,
+                "templates_tracked_exactly": len(fps),
                 "tracking_cap": FP_CAP,
                 "messages_beyond_cap": untracked,
                 "top_templates": top,
