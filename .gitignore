@@ -7,3 +7,6 @@ tclk/node_modules/
 mcp_publish/mcp-publisher
 mcp_publish/mcp-publisher.tar.gz
 *.pyc
+did_activity.db
+did_activity.db-*
+did_activity.db.lock
