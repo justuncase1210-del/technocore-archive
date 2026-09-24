@@ -1539,6 +1539,9 @@ def _room_stats(path: Path) -> dict:
     }
 
 
+LAZY_ROOM_STATS_MAX_BYTES = 200 * 1024 * 1024
+
+
 @app.get("/stats")
 def stats(room: str | None = None):
     """Free -- engagement metrics computed from the full durable archive, not
@@ -1558,6 +1561,11 @@ def stats(room: str | None = None):
             for entry in hit[1].get("rooms", []):
                 if entry.get("room") == room:
                     return entry
+        # Aggregate not warm yet (first minutes after a restart): a lazy scan is
+        # fine for a small room, but on a multi-GB one it runs past the gateway
+        # timeout and ties up the box's single vCPU for minutes.
+        if path.stat().st_size > LAZY_ROOM_STATS_MAX_BYTES:
+            return {"room": room, "rooms": [], "warming_up": True}
         return _cached(f"stats:{room}", lambda: _room_stats(path))
     hit = _endpoint_cache.get("stats:_all_")
     if hit is None:
