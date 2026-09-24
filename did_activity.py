@@ -98,10 +98,10 @@ def connect_writer(db_path) -> sqlite3.Connection:
     return conn
 
 
-def connect_reader(db_path) -> sqlite3.Connection:
+def connect_reader(db_path, timeout: float = 10) -> sqlite3.Connection:
     # Deliberately not mode=ro: a read-only connection can't create the WAL
     # -shm file, and the builder's own close may have removed it.
-    conn = sqlite3.connect(str(db_path), timeout=10)
+    conn = sqlite3.connect(str(db_path), timeout=timeout)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -328,18 +328,21 @@ def build(archive_dir: Path, db_path: Path, full: bool = False) -> dict:
 
 # ------------------------------------------------------------------ query --
 
-def is_ready(db_path) -> bool:
+def is_ready(db_path, timeout: float = 10) -> bool | None:
+    """True/False, or None when the database couldn't be read right now (busy
+    or mid-write) -- callers should keep their last known answer rather than
+    treat a transient read failure as "not built"."""
     if not Path(db_path).exists():
         return False
     try:
-        conn = connect_reader(db_path)
+        conn = connect_reader(db_path, timeout)
         try:
             row = conn.execute("SELECT value FROM meta WHERE key='ready'").fetchone()
             return bool(row) and row[0] == "1"
         finally:
             conn.close()
     except sqlite3.Error:
-        return False
+        return None
 
 
 def generated_at(conn) -> str | None:

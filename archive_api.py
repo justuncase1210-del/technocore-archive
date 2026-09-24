@@ -578,6 +578,29 @@ _DID_INDEX_PATHS = {
 }
 
 
+_index_ready_state = {"value": False, "checked": 0.0}
+_INDEX_READY_TTL_WHEN_READY = 60.0
+_INDEX_READY_TTL_WHEN_NOT = 15.0
+
+
+async def _index_ready() -> bool:
+    """Cached, and checked in a thread: this runs in middleware on the event
+    loop, and a synchronous SQLite open there -- against a database the
+    builder is writing hard, with a multi-second busy timeout -- can stall
+    every request the app is serving, /health included. A read that fails
+    (busy) keeps the last known answer instead of flipping it."""
+    st = _index_ready_state
+    ttl = _INDEX_READY_TTL_WHEN_READY if st["value"] else _INDEX_READY_TTL_WHEN_NOT
+    now = time.monotonic()
+    if now - st["checked"] < ttl:
+        return st["value"]
+    st["checked"] = now  # before the await, so a burst of requests triggers one check, not many
+    result = await asyncio.to_thread(did_activity.is_ready, DID_INDEX_DB, 2.0)
+    if result is not None:
+        st["value"] = result
+    return st["value"]
+
+
 class _DidIndexReadyGuard:
     """Sits OUTSIDE PaymentMiddlewareASGI (Starlette runs the most recently
     added middleware first). x402 settles before a route handler runs, so a
@@ -590,7 +613,7 @@ class _DidIndexReadyGuard:
 
     async def __call__(self, scope, receive, send):
         if (scope["type"] == "http" and scope.get("path") in _DID_INDEX_PATHS
-                and not did_activity.is_ready(DID_INDEX_DB)):
+                and not await _index_ready()):
             body = json.dumps({
                 "detail": "the activity index is still being built -- try again in a few minutes. "
                           "No payment was taken for this request.",
