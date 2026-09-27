@@ -1,0 +1,5 @@
+# Everything here runs on Linux. Force LF on checkout on every platform --
+# with Windows core.autocrlf=true, a fresh clone got CRLF everywhere, which
+# breaks shell scripts copied into the image (a "\r" on the #! line) and made
+# every file show as modified on the box after a Windows-seeded restore.
+* text=auto eol=lf
