@@ -212,8 +212,9 @@ def _ensure_watch_all_running() -> None:
         _warn_uv_missing_once()
         return
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = ARCHIVE_DIR / "watch-all.log"
-    log_file = open(log_path, "a")
+    # An unopenable log here used to raise out of _resume_watchers -- killing
+    # the watchdog loop, and with it every scheduled job -- or crash startup.
+    log_file = _open_log(ARCHIVE_DIR / "watch-all.log")
     subprocess.Popen(
         [
             uv_bin, "run", str(TECHNOCORE_SCRIPT), "watch-all",
@@ -303,6 +304,19 @@ def _rebuild_close1_index_async() -> None:
         _launch_index_build("close1_index.py", CLOSE1_INDEX_DB, "close1-index.log")
 
 
+def _open_log(path: Path):
+    """Append handle for a child process's log -- or DEVNULL, loudly, if it
+    can't be opened. A log the service user can't write (a root-owned file
+    from a manual run) used to make the launcher give up silently, and the
+    DID index then went 2.5 days without an incremental update. A missing log
+    is a nuisance; a job that silently stops running is not."""
+    try:
+        return open(path, "a")
+    except OSError as e:
+        print(f"WARNING: can't open {path} ({e}); starting without a log file", file=sys.stderr, flush=True)
+        return subprocess.DEVNULL
+
+
 def _launch_index_build(script_name: str, db: Path, log_name: str) -> None:
     uv_bin = _resolve_uv()
     script = Path(__file__).parent / script_name
@@ -316,15 +330,14 @@ def _launch_index_build(script_name: str, db: Path, log_name: str) -> None:
         pass
     try:
         ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        log_file = open(ARCHIVE_DIR / log_name, "a")
         subprocess.Popen(
             [uv_bin, "run", str(script), "build", "--archive-dir", str(ARCHIVE_DIR), "--db", str(db)],
             cwd=str(Path(__file__).parent),
-            stdout=log_file, stderr=subprocess.STDOUT,
+            stdout=_open_log(ARCHIVE_DIR / log_name), stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"WARNING: couldn't launch {script_name} build: {e}", file=sys.stderr, flush=True)
 
 
 LOG_ROTATE_BYTES = 50 * 1024 * 1024
@@ -865,14 +878,34 @@ def landing_page():
     return LANDING_HTML_PATH.read_text(encoding="utf-8")
 
 
+def _index_generated_at(db: Path) -> str | None:
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db), timeout=1)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='generated_at'").fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 @app.get("/health")
 def health():
+    # Index timestamps make a stalled incremental build visible from outside:
+    # each should be at most ~10 minutes old (plus one build's run time).
     return {
         "ok": True,
         "network": NETWORK,
         "address": WALLET_ADDRESS,
         "uv_available": _resolve_uv() is not None,
         "node_available": _resolve_node() is not None,
+        "index_generated_at": {
+            "did_activity": _index_generated_at(DID_INDEX_DB),
+            "close1": _index_generated_at(CLOSE1_INDEX_DB),
+        },
     }
 
 
