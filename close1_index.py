@@ -34,7 +34,7 @@ TRADE_ROOM = "close1"
 REFEREE_ROOMS = ("d-close1-flow", "d-close1-state", "d-close1-pnl", "d-close1-positions")
 SOURCES = (TRADE_ROOM,) + REFEREE_ROOMS
 FLUSH_EVERY = 50_000
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"  # v2: gaps computed from close1's seq sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -53,8 +53,9 @@ CREATE TABLE IF NOT EXISTS mints(did TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHO
 CREATE TABLE IF NOT EXISTS sweeps(n INTEGER PRIMARY KEY, ts TEXT, omitted TEXT, missed TEXT, owners INTEGER);
 CREATE TABLE IF NOT EXISTS board(kind TEXT NOT NULL, did TEXT NOT NULL, n INTEGER NOT NULL, rank INTEGER NOT NULL,
     value TEXT, PRIMARY KEY(kind, did, n)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gaps(from_seq INTEGER PRIMARY KEY, to_seq INTEGER NOT NULL);
 """
-_DATA_TABLES = ("progress", "coverage", "regs", "owner_rooms", "posts", "outcomes", "mints", "sweeps", "board")
+_DATA_TABLES = ("progress", "coverage", "regs", "owner_rooms", "posts", "outcomes", "mints", "sweeps", "board", "gaps")
 
 
 def connect_writer(db_path) -> sqlite3.Connection:
@@ -168,6 +169,16 @@ def _process(c, room: str, path: Path, start: int, progress_key: str | None = No
         return 0
     offset, pending, added = start, 0, 0
     last = None
+    row = c.execute("SELECT value FROM meta WHERE key='close1_prev_seq'").fetchone()
+    prev_seq = int(row[0]) if row and room == TRADE_ROOM else None
+
+    def checkpoint():
+        _note_coverage(c, room, last.get("seq"), last.get("ts"))
+        c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
+        if room == TRADE_ROOM and prev_seq is not None:
+            c.execute("INSERT OR REPLACE INTO meta VALUES ('close1_prev_seq', ?)", (str(prev_seq),))
+        c.commit()
+
     with open(path, "rb") as f:
         f.seek(start)
         for raw in f:
@@ -183,40 +194,34 @@ def _process(c, room: str, path: Path, start: int, progress_key: str | None = No
                           (room, msg.get("seq"), msg.get("ts")))
             last = msg
             if room == TRADE_ROOM:
+                seq = msg.get("seq")
+                if isinstance(seq, int):
+                    # Seqs are contiguous within a room, so any jump is messages
+                    # this archive doesn't have -- computed from what's actually
+                    # on disk, not from the watcher's own report.
+                    if prev_seq is not None and seq > prev_seq + 1:
+                        c.execute("INSERT OR IGNORE INTO gaps VALUES (?,?)", (prev_seq + 1, seq - 1))
+                    prev_seq = seq if prev_seq is None else max(prev_seq, seq)
                 _apply_trade_room(c, msg)
             else:
                 _apply_referee_room(c, room, msg)
             added += 1
             pending += 1
             if pending >= FLUSH_EVERY:
-                _note_coverage(c, room, last.get("seq"), last.get("ts"))
-                c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
-                c.commit()
+                checkpoint()
                 pending = 0
     if last is not None:
-        _note_coverage(c, room, last.get("seq"), last.get("ts"))
-    c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
-    c.commit()
+        checkpoint()
+    else:
+        c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
+        c.commit()
     return added
-
-
-def _read_gaps(archive_dir: Path) -> list:
-    gaps = []
-    try:
-        with open(archive_dir / f"{TRADE_ROOM}.gaps", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    gaps.append(json.loads(line))
-                except ValueError:
-                    continue
-    except FileNotFoundError:
-        pass
-    return gaps
 
 
 def _reset(c) -> None:
     for t in _DATA_TABLES:
         c.execute(f"DELETE FROM {t}")
+    c.execute("DELETE FROM meta WHERE key='close1_prev_seq'")
     c.execute("INSERT OR REPLACE INTO meta VALUES ('ready', '0')")
     c.commit()
 
@@ -265,8 +270,7 @@ def build(archive_dir: Path, db_path: Path) -> dict:
                 print(f"archive {e} shrank below its indexed offset -- full rebuild", flush=True)
                 _reset(conn)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
-                         [("generated_at", now), ("ready", "1"), ("close1_gaps", json.dumps(_read_gaps(archive_dir)))])
+        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [("generated_at", now), ("ready", "1")])
         conn.commit()
         return {"messages_indexed": added, "generated_at": now}
     finally:
@@ -346,12 +350,15 @@ def account(conn, did: str) -> dict:
         mint_info = {"status": "no_record", "reason": "no registration, trade or board entry for this key in the archive"}
 
     c1 = cov.get(TRADE_ROOM, {})
-    gaps = json.loads(meta.get("close1_gaps") or "[]")
+    gap_rows = conn.execute("SELECT from_seq, to_seq FROM gaps ORDER BY from_seq").fetchall()
+    gaps = [{"from_seq": g["from_seq"], "to_seq": g["to_seq"]} for g in gap_rows]
+    missing = sum(g["to_seq"] - g["from_seq"] + 1 for g in gaps)
     notes = [
         f"close1 archive starts at seq {c1.get('first_seq')} ({c1.get('first_ts')}); technocore.chat keeps only "
         "~12 minutes of close1, so earlier registrations and trades were already gone when archiving began.",
-        (f"close1 has {len(gaps)} recorded gap(s) -- seq ranges evicted before they could be archived; "
-         "see coverage.close1_gaps." if gaps else "No gaps recorded in the close1 archive since it began."),
+        (f"close1 archive has {len(gaps)} gap(s) totalling {missing} messages -- seq ranges evicted before "
+         "they could be archived; a trade or registration inside one isn't visible here. See "
+         "coverage.close1_gaps." if gaps else "No gaps in the close1 archive since it began."),
         "Only close1 is archived: trades posted in other registered trading rooms aren't here.",
         "not_listed means no referee flow post names the trade id -- flow posts omit part of every busy "
         "sweep (see each sweep's 'omitted' counts), so it is not proof the trade was void.",
@@ -368,7 +375,7 @@ def account(conn, did: str) -> dict:
         "trades_truncated": len(rows) > MAX_TRADES,
         "trades": trades,
         "coverage": {**{r: {k: v for k, v in d.items() if k != "room"} for r, d in cov.items()},
-                     "close1_gaps": gaps[-50:]},
+                     "close1_gaps": gaps[-50:], "close1_gap_count": len(gaps), "close1_messages_missing": missing},
         "notes": notes,
     }
 

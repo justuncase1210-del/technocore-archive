@@ -58,6 +58,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 from nacl.signing import SigningKey, VerifyKey
 
@@ -340,15 +341,68 @@ def cmd_watch(args):
         print(f"\nstopped. {written} messages archived this run, last seq {seq}", flush=True)
 
 
+IDLE_SLEEP = 45.0       # after a poll that found nothing new
+TARGET_PER_POLL = 100   # adaptive pacing aims for this many messages per poll, well under the 200 cap
+MAX_WAIT = 10           # technocore.chat holds a long-poll at most 10 seconds
+
+
+def _gaps_path(out: str) -> str:
+    return out[: -len(".jsonl")] + ".gaps"
+
+
+def _record_gap(room: str, out: str, first: int, last: int) -> None:
+    gap = {"from_seq": first, "to_seq": last, "detected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    print(f"[{room}] GAP: seq {first}..{last} was evicted before it could be archived", file=sys.stderr, flush=True)
+    with open(_gaps_path(out), "a", encoding="utf-8") as g:
+        g.write(json.dumps(gap) + "\n")
+
+
+def _fetch_export(room: str):
+    """(status, messages sorted by seq) for the room's whole retained ring, or (status, None)."""
+    status, body = http_get(f"/r/{path_segment(room)}/export", timeout=120)
+    if status != 200:
+        return status, None
+    msgs = []
+    for line in body.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(msg, dict) and isinstance(msg.get("seq"), int):
+            msgs.append(msg)
+    msgs.sort(key=lambda m: m["seq"])
+    return status, msgs
+
+
+def _ring_span_seconds(msgs: list) -> float | None:
+    try:
+        a = datetime.fromisoformat(msgs[0]["ts"].replace("Z", "+00:00"))
+        b = datetime.fromisoformat(msgs[-1]["ts"].replace("Z", "+00:00"))
+        return (b - a).total_seconds()
+    except (IndexError, KeyError, AttributeError, ValueError):
+        return None
+
+
 def _watch_room_loop(room: str, out: str, wait: int, stop_event: threading.Event) -> None:
     """Same long-poll/resume/append logic as cmd_watch, as a stoppable loop for use
     from a worker thread (see cmd_watch_all). Kept separate from cmd_watch itself,
     not refactored into it, so the single-room CLI command's already-tested behavior
-    is untouched by this."""
+    is untouched by this.
+
+    technocore.chat answers `since=<seq>` with the NEWEST <=200 messages after
+    seq, not the next 200 -- confirmed live (since=latest-6000 returned the
+    latest 200). So if more than 200 messages land between polls, the ones in
+    between are skipped, silently: that is how busy rooms like lobby ended up
+    missing over half their seqs. Two defenses: pace polls to the room's own
+    rate so each returns ~100 (under the cap), and on any seq jump fetch the
+    whole retained ring via /export to fill it, recording whatever is already
+    gone in <room>.gaps instead of skipping it."""
+    wait = min(wait, MAX_WAIT)
     resume_from = _last_archived_seq(out)
     print(f"[{room}] archiving -> {out}  (resuming from seq {resume_from})", flush=True)
     seq = resume_from
     written = 0
+    last_poll = time.monotonic()
     with open(out, "a", encoding="utf-8") as f:
         while not stop_event.is_set():
             qs = urllib.parse.urlencode(
@@ -368,17 +422,31 @@ def _watch_room_loop(room: str, out: str, wait: int, stop_event: threading.Event
                 print(f"[{room}] non-JSON response, skipping: {body[:200]!r}", file=sys.stderr)
                 stop_event.wait(5)
                 continue
-            new_this_poll = 0
-            for msg in data.get("messages", []):
-                if msg["seq"] <= seq:
-                    continue
+            new = sorted((m for m in data.get("messages", []) if m["seq"] > seq), key=lambda m: m["seq"])
+            if new and seq and new[0]["seq"] > seq + 1:
+                # More than a page arrived since the last poll: this reply skipped
+                # some. The ring still holds them unless they're already evicted.
+                _st, ring = _fetch_export(room)
+                if ring is not None:
+                    merged = {m["seq"]: m for m in ring if m["seq"] > seq}
+                    merged.update({m["seq"]: m for m in new})
+                    new = [merged[k] for k in sorted(merged)]
+            for msg in new:
+                if seq and msg["seq"] > seq + 1:
+                    _record_gap(room, out, seq + 1, msg["seq"] - 1)
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
                 seq = msg["seq"]
                 written += 1
-                new_this_poll += 1
-            if new_this_poll:
+            now = time.monotonic()
+            elapsed, last_poll = now - last_poll, now
+            if new:
                 f.flush()
-                print(f"[{room}] +{new_this_poll} (total {written}), at seq {seq}", flush=True)
+                print(f"[{room}] +{len(new)} (total {written}), at seq {seq}", flush=True)
+                rate = len(new) / max(elapsed, 1.0)
+                pause = max(2.0, min(IDLE_SLEEP, TARGET_PER_POLL / rate - wait))
+            else:
+                pause = IDLE_SLEEP
+            stop_event.wait(pause)
     print(f"[{room}] stopped. {written} messages archived this run, last seq {seq}", flush=True)
 
 
@@ -396,40 +464,30 @@ def _export_room_loop(room: str, out: str, interval: int, stop_event: threading.
     missing seq range is logged and recorded in <out minus .jsonl>.gaps, never
     silently skipped."""
     last = _last_archived_seq(out)
-    gaps_path = out[: -len(".jsonl")] + ".gaps"
-    print(f"[{room}] export-mode archiving -> {out} every {interval}s (resuming from seq {last})", flush=True)
+    print(f"[{room}] export-mode archiving -> {out}, at most every {interval}s (resuming from seq {last})",
+          flush=True)
     while not stop_event.is_set():
-        status, body = http_get(f"/r/{path_segment(room)}/export", timeout=120)
+        status, msgs = _fetch_export(room)
         if stop_event.is_set():
             break
-        if status != 200:
-            print(f"[{room}] export HTTP {status}: {body[:200]}", file=sys.stderr, flush=True)
+        if msgs is None:
+            print(f"[{room}] export HTTP {status}", file=sys.stderr, flush=True)
             stop_event.wait(65 + random.uniform(0, 10) if status == 429 else 30)
             continue
-        msgs = []
-        for line in body.splitlines():
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(msg, dict) and isinstance(msg.get("seq"), int):
-                msgs.append(msg)
-        msgs.sort(key=lambda m: m["seq"])
-        if msgs and last and msgs[0]["seq"] > last + 1:
-            gap = {"from_seq": last + 1, "to_seq": msgs[0]["seq"] - 1,
-                   "detected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-            print(f"[{room}] GAP: seq {gap['from_seq']}..{gap['to_seq']} was evicted before it could be "
-                  "archived", file=sys.stderr, flush=True)
-            with open(gaps_path, "a", encoding="utf-8") as g:
-                g.write(json.dumps(gap) + "\n")
         new = [m for m in msgs if m["seq"] > last]
         if new:
             with open(out, "a", encoding="utf-8") as f:
                 for m in new:
+                    if last and m["seq"] > last + 1:
+                        _record_gap(room, out, last + 1, m["seq"] - 1)
                     f.write(json.dumps(m, ensure_ascii=False) + "\n")
-            last = new[-1]["seq"]
+                    last = m["seq"]
             print(f"[{room}] export +{len(new)}, at seq {last}", flush=True)
-        stop_event.wait(interval)
+        # Next fetch at a third of the ring's actual time span (how long the room
+        # currently retains), so a burst of traffic that shrinks the ring also
+        # shortens the interval -- bounded to [60s, interval].
+        span = _ring_span_seconds(msgs)
+        stop_event.wait(max(60.0, min(float(interval), span / 3)) if span else float(interval))
 
 
 def cmd_watch_all(args):
@@ -478,7 +536,7 @@ def cmd_watch_all(args):
             return []
 
     export_rooms_file = getattr(args, "export_rooms_file", None)
-    export_interval = getattr(args, "export_interval", 180)
+    export_interval = getattr(args, "export_interval", 600)
 
     def _read_export_rooms() -> set[str]:
         # Read when a room's thread starts; switching a running room between
@@ -502,9 +560,11 @@ def cmd_watch_all(args):
         threads[room] = t
         t.start()
 
+    # 1.5s apart: starting ~40 threads that each poll immediately is itself a
+    # burst that can trip technocore.chat's per-IP edge limit.
     for room in _read_rooms():
         _start_room(room)
-        stop_event.wait(0.5)
+        stop_event.wait(1.5)
     print(f"watch-all: started {len(threads)} room threads, "
          f"rescanning {rooms_file} every {rescan}s", flush=True)
 
@@ -515,7 +575,7 @@ def cmd_watch_all(args):
                 if room in threads:
                     print(f"[{room}] thread died, restarting", file=sys.stderr)
                 _start_room(room)
-                stop_event.wait(0.5)
+                stop_event.wait(1.5)
 
     for room, t in threads.items():
         t.join(timeout=20)
@@ -659,8 +719,9 @@ def main():
     sp.add_argument("--wait", type=int, default=25, help="long-poll seconds per request")
     sp.add_argument("--export-rooms-file", default=None,
                     help="rooms to archive by periodic /export instead of long-polling (very high-volume rooms)")
-    sp.add_argument("--export-interval", type=int, default=180,
-                    help="seconds between exports for --export-rooms-file rooms")
+    sp.add_argument("--export-interval", type=int, default=600,
+                    help="max seconds between exports for --export-rooms-file rooms (the actual interval "
+                         "adapts to a third of each room's retained time span, min 60s)")
     sp.add_argument("--rescan-seconds", type=int, default=30,
                     help="how often to re-read --rooms-file for new/removed rooms")
     sp.set_defaults(func=cmd_watch_all)

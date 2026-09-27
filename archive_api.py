@@ -220,7 +220,7 @@ def _ensure_watch_all_running() -> None:
             "--rooms-file", str(ROOMS_FILE),
             "--export-rooms-file", str(EXPORT_ROOMS_FILE),
             "--out-dir", str(ARCHIVE_DIR),
-            "--wait", "25", "--rescan-seconds", "30",
+            "--wait", "10", "--rescan-seconds", "30",
         ],
         cwd=str(TECHNOCORE_SCRIPT.parent),
         stdout=log_file,
