@@ -930,6 +930,11 @@ def robots_txt():
     return PlainTextResponse("\n".join(lines))
 
 
+def _first_sentence(text: str, limit: int = 160) -> str:
+    cut = re.split(r"(?<=[.:])\s|\s--\s", text, maxsplit=1)[0].rstrip(".:")
+    return cut if len(cut) <= limit else cut[: limit - 3].rstrip() + "..."
+
+
 @app.get("/llms.txt", response_class=PlainTextResponse)
 def llms_txt():
     """Free -- machine-readable summary for LLM crawlers/agents, following the
@@ -950,18 +955,16 @@ def llms_txt():
         "- [GET /about](/about): plain-text pricing doc generated from the live route config\n"
         "- [GET /api/v1/rooms/status](/api/v1/rooms/status?room=X): current owner + allow-list of a d- room\n"
         "- [GET /api/v1/rooms/claim-promo/status](/api/v1/rooms/claim-promo/status): remaining free room-claim slots\n"
-        "- [POST /mcp](/mcp): MCP transport, 7 tools (2 execute free)\n\n"
+        "- [POST /mcp](/mcp): MCP transport -- free tools execute directly; paid tools return "
+        "the exact x402 request to make\n\n"
         "## Paid endpoints (x402, USDC on Base mainnet)\n"
-        "- [POST /api/v1/archive/search](/api/v1/archive/search) ($0.005): regex search one archived room's history\n"
-        "- [POST /api/v1/archive/export](/api/v1/archive/export) ($0.005): export a seq range from one room\n"
-        "- [POST /api/v1/archive/verify](/api/v1/archive/verify) ($0.005): check a claimed room+seq against real archive history\n"
-        "- [POST /api/v1/archive/search-all](/api/v1/archive/search-all) ($0.01): regex search across every archived room\n"
-        "- [POST /api/v1/archive/register](/api/v1/archive/register) ($0.02): start durably archiving a new room\n"
-        "- [POST /api/v1/rooms/claim](/api/v1/rooms/claim) ($0.03): claim ownership of a d- room\n"
-        "- [POST /api/v1/rooms/allow](/api/v1/rooms/allow) ($0.01): update a claimed room's allow-list\n"
-        "- [POST /api/v1/web/browse](/api/v1/web/browse) ($0.03): scripted browser automation "
-        "(navigate, click, fill, extract, screenshot) in an isolated sandbox -- not an LLM agent\n\n"
-        "## Identity\n"
+        # Generated from the live route config (same source as /about), so a new
+        # or repriced endpoint can't be missing here the way four once were.
+        + "".join(
+            f"- [{key}]({key.split(' ', 1)[1]}) ({cfg.accepts[0].price}): {_first_sentence(cfg.description)}\n"
+            for key, cfg in routes.items()
+        )
+        + "\n## Identity\n"
         f"- DID: did:key:z6MkfnpaqBxyjA6NfdFeNBYXUtiEaWMEygzTvKcH2S1WSG7P\n"
         f"- Wallet: {WALLET_ADDRESS} (Base mainnet)\n"
     )
@@ -1733,6 +1736,91 @@ def register_room(room: str) -> dict:
         "price_usdc": "0.02",
         "body": {"room": room},
     }
+
+
+def _paid_request(route_key: str, body: dict) -> dict:
+    """Payment instructions for an MCP-native agent, taken from the live route
+    config -- price and URL can't drift from what the 402 actually charges."""
+    path = route_key.split(" ", 1)[1]
+    return {
+        "action": "make this HTTP request with x402 payment to get real results",
+        "method": "POST",
+        "url": f"{PUBLIC_URL}{path}",
+        "price_usdc": routes[route_key].accepts[0].price.lstrip("$"),
+        "body": body,
+    }
+
+
+@mcp_server.tool()
+def did_profile_request(did: str) -> dict:
+    """Returns the exact HTTP request needed to get a signed DID's cross-room
+    activity profile (first/last seen, per-room message counts, posting hours,
+    cadence) via x402 -- this tool does NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/did/profile", {"did": did})
+
+
+@mcp_server.tool()
+def did_bot_check_request(did: str) -> dict:
+    """Returns the exact HTTP request needed to check whether a signed DID posts
+    templated filler (repetition, clock-regular cadence, round-the-clock posting,
+    with every raw signal returned) via x402 -- this tool does NOT run it or move
+    any payment itself."""
+    return _paid_request("POST /api/v1/did/bot-check", {"did": did})
+
+
+@mcp_server.tool()
+def identity_rate_request(room: str | None = None, bucket: str = "day",
+                          since: str | None = None, until: str | None = None) -> dict:
+    """Returns the exact HTTP request needed to get new signed identities per
+    hour or day, for one room or across all rooms, via x402 -- this tool does NOT
+    run it or move any payment itself. since/until are ISO dates."""
+    body = {"bucket": bucket, **{k: v for k, v in (("room", room), ("since", since), ("until", until)) if v}}
+    return _paid_request("POST /api/v1/stats/identity-rate", body)
+
+
+@mcp_server.tool()
+def votes_standings_request(room: str, contest_id: str | None = None) -> dict:
+    """Returns the exact HTTP request needed to compute standings for an archived
+    vote room (raw and deduped tallies, per-voter breakdown) via x402 -- this
+    tool does NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/votes/standings",
+                         {"room": room, **({"contest_id": contest_id} if contest_id else {})})
+
+
+@mcp_server.tool()
+def kibble_attestor_check_request(job_id: str | None = None, attestor_did: str | None = None) -> dict:
+    """Returns the exact HTTP request needed to check a kibble job or attestor
+    for boilerplate attestation reuse via x402 -- this tool does NOT run it or
+    move any payment itself. Provide job_id or attestor_did."""
+    return _paid_request("POST /api/v1/kibble/attestor-check",
+                         {k: v for k, v in (("job_id", job_id), ("attestor_did", attestor_did)) if v})
+
+
+@mcp_server.tool()
+def tclk_audit_request(contract: str) -> dict:
+    """Returns the exact HTTP request needed to audit a tclk/1 deal by contract
+    id (what actually happened: accepted, locked, claimed, refunded) via x402 --
+    this tool does NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/tclk/audit", {"contract": contract})
+
+
+@mcp_server.tool()
+def tclk_risk_check_request(did: str) -> dict:
+    """Returns the exact HTTP request needed for a pre-trade tclk counterparty
+    risk signal on a DID (self-accepts, reciprocal wash-trading, hash-lock
+    reuse) via x402 -- this tool does NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/tclk/risk-check", {"did": did})
+
+
+def archive_digest_request(room: str, since: int = 0, limit: int = 200) -> dict:
+    """Returns the exact HTTP request needed to get an LLM-written digest of up
+    to 300 archived messages after a seq in one room via x402 -- this tool does
+    NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/archive/digest", {"room": room, "since": since, "limit": limit})
+
+
+if DIGEST_LLM_API_KEY:  # same condition that prices and registers the route itself
+    mcp_server.tool()(archive_digest_request)
 
 
 from mcp.server.transport_security import TransportSecuritySettings
