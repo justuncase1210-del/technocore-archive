@@ -1,0 +1,19 @@
+# The Dockerfile does `COPY . /opt/workspace-seed` into an image pushed to
+# Docker Hub (public by default). Nothing below may ever end up in it: keys and
+# wallet material, and live runtime state that belongs on the persistent volume.
+identity.key
+*.key
+.env
+.env.*
+wallet*
+mailbox_info.txt
+archives/
+did_activity.db*
+rooms.txt
+sybil_signals.json
+tclk_did_index.json
+archive_api.log
+__pycache__/
+*.pyc
+tclk/node_modules/
+mcp_publish/mcp-publisher*
