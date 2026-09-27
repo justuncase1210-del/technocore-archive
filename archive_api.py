@@ -327,6 +327,37 @@ def _launch_index_build(script_name: str, db: Path, log_name: str) -> None:
         pass
 
 
+LOG_ROTATE_BYTES = 50 * 1024 * 1024
+LOG_KEEP_BYTES = 5 * 1024 * 1024
+
+
+def _rotate_logs() -> None:
+    """Bounds the logs under ARCHIVE_DIR (watch-all.log reached 2.6M lines).
+    Their writers -- the watcher and the index builders -- hold them open in
+    append mode for their whole lifetime, so rename-based rotation would leave
+    them writing into the renamed file. Truncating in place is safe with
+    O_APPEND writers: the next write lands at the new end. The last
+    LOG_KEEP_BYTES are kept first as <name>.1 (one generation); anything
+    written in the instant between that copy and the truncate is lost."""
+    for log in ARCHIVE_DIR.glob("*.log"):
+        try:
+            size = log.stat().st_size
+            if size <= LOG_ROTATE_BYTES:
+                continue
+            with open(log, "rb") as f:
+                f.seek(size - LOG_KEEP_BYTES)
+                f.readline()  # start the kept tail on a line boundary
+                tail = f.read()
+            kept = log.with_name(log.name + ".1")
+            tmp = log.with_name(log.name + ".1.tmp")
+            tmp.write_bytes(tail)
+            os.replace(tmp, kept)
+            with open(log, "r+b") as f:
+                f.truncate(0)
+        except OSError:
+            continue  # e.g. a log owned by another user; try again next tick
+
+
 _watchdog_tick_count = 0
 
 
@@ -337,6 +368,7 @@ async def _watchdog_loop() -> None:
         _resume_watchers()
         _rebuild_did_activity_index_async()
         _rebuild_close1_index_async()
+        await asyncio.to_thread(_rotate_logs)
         await asyncio.to_thread(_refresh_room_and_stats_caches)
         _watchdog_tick_count += 1
         if _watchdog_tick_count % TCLK_INDEX_REBUILD_EVERY_N_TICKS == 0:
@@ -468,9 +500,10 @@ routes: dict[str, RouteConfig] = {
         "$0.005",
         "Verify whether a specific room+seq actually exists in this archive, and what it "
         "actually says -- useful for checking a claimed contribution-proof link against "
-        "reality once the live room has evicted it. Absence in this archive is not proof "
-        "a message never existed (it may predate this archive's coverage of that room), "
-        "but presence with a text mismatch is a real, checkable finding.",
+        "reality once the live room has evicted it. Presence with a text mismatch is a real, "
+        "checkable finding. Absence is never treated as proof: it comes with the exact reason "
+        "-- before this archive's coverage of the room, after its latest message, or inside a "
+        "known gap in the archive (with the missing seq range).",
         {"room": "lobby", "seq": 12345, "claimed_text": "optional -- what it's claimed to say"},
     ),
     "POST /api/v1/archive/search-all": _route(
@@ -737,18 +770,23 @@ def _index_offset(room: str, seq: int) -> int:
         return 0
 
 
-def _messages_after(room: str, path: Path, since: int, deadline: float | None = None):
+def _messages_after(room: str, path: Path, since: int, deadline: float | None = None,
+                    seen: dict | None = None):
     """Messages with seq > since. Seeks to the activity index's nearest
     checkpoint at or before `since` instead of reading a multi-GB file from the
     top -- milliseconds instead of a gateway timeout on lobby. Falls back to a
     full read when there's no checkpoint yet (index still building, or a room
     registered since the last index run). Raises _ScanBudgetExceeded once
-    `deadline` (time.monotonic()) passes."""
+    `deadline` (time.monotonic()) passes. If `seen` is given, seen["prev"] is
+    left at the highest archived seq <= since that the scan passed (None if
+    the archive has nothing that early)."""
     offset = _index_offset(room, since)
     last = since
     for start in ((offset, 0) if offset else (0,)):
         stale = False
         first = True
+        if seen is not None:
+            seen["prev"] = None
         for msg in _iter_messages_from(path, start):
             seq = msg.get("seq")
             if not isinstance(seq, int):
@@ -766,6 +804,8 @@ def _messages_after(room: str, path: Path, since: int, deadline: float | None = 
                     break
             if seq > since:
                 yield msg
+            elif seen is not None:
+                seen["prev"] = seq
         # A valid checkpoint always has its own line at its offset, so reading
         # nothing at all from a non-zero offset (e.g. the file was rewritten
         # shorter than it) also means the index is stale.
@@ -1179,15 +1219,46 @@ def _archive_export_scan(room, path, since, limit, deadline):
 
 
 def _archive_verify_scan(room, path, seq, deadline):
-    """(message or None, scan_complete). Seqs are written in increasing order,
-    so the first message past seq-1 either is `seq` or proves it isn't here --
-    no need to read to the end of the file."""
+    """(message or None, scan_complete, prev_seq, next_seq). Seqs are written in
+    increasing order, so the first message past seq-1 either is `seq` or
+    proves it isn't here -- no need to read to the end of the file. prev_seq /
+    next_seq are the archived seqs just below / above `seq` when it's absent."""
+    seen: dict = {}
     try:
-        for msg in _messages_after(room, path, seq - 1, deadline):
-            return (msg, True) if msg["seq"] == seq else (None, True)
+        for msg in _messages_after(room, path, seq - 1, deadline, seen):
+            if msg["seq"] == seq:
+                return msg, True, None, None
+            return None, True, seen.get("prev"), msg["seq"]
     except _ScanBudgetExceeded:
-        return None, False
-    return None, True
+        return None, False, None, None
+    return None, True, seen.get("prev"), None
+
+
+def _absence(seq: int, prev_seq, next_seq) -> dict:
+    """Why a seq isn't in this archive. Seqs are contiguous within a
+    technocore-chat room, so a seq missing BETWEEN two archived ones is a hole
+    in this archive's copy -- not evidence about the message itself."""
+    if prev_seq is not None and next_seq is not None:
+        return {
+            "absence_reason": "archive_gap",
+            "archive_gap": {"from_seq": prev_seq + 1, "to_seq": next_seq - 1},
+            "note": f"seq {seq} falls inside a gap in this archive (seqs {prev_seq + 1}..{next_seq - 1} "
+                    "were never captured -- evicted by the live room before they were archived). This "
+                    "archive can neither confirm nor deny that message; it is NOT evidence it didn't exist.",
+        }
+    if prev_seq is None and next_seq is not None:
+        return {
+            "absence_reason": "before_archive_coverage",
+            "archive_first_seq": next_seq,
+            "note": f"seq {seq} predates this archive's coverage of the room (its first archived seq is "
+                    f"{next_seq}). Not evidence either way.",
+        }
+    return {
+        "absence_reason": "after_archive_latest",
+        "archive_last_seq": prev_seq,
+        "note": f"seq {seq} is newer than this archive's latest message for the room (seq {prev_seq}) -- it "
+                "may not exist yet, or the archive hasn't caught up. Not evidence either way.",
+    }
 
 
 @app.post("/api/v1/archive/verify")
@@ -1205,7 +1276,7 @@ async def archive_verify(body: dict = None):
 
     path = _archive_path(room)  # 404s if this room isn't archived at all
     deadline = time.monotonic() + SCAN_BUDGET_SECONDS
-    msg, complete = await asyncio.to_thread(_archive_verify_scan, room, path, seq, deadline)
+    msg, complete, prev_seq, next_seq = await asyncio.to_thread(_archive_verify_scan, room, path, seq, deadline)
     if msg is not None:
         return {
             "room": room,
@@ -1225,15 +1296,7 @@ async def archive_verify(body: dict = None):
             "seq, so this is neither a found nor a not-found result. This only happens before the "
             "archive's seq index has caught up to this room -- retry shortly.",
         }
-    return {
-        "room": room,
-        "seq": seq,
-        "found": False,
-        "text_matches": None,
-        "note": "not found in this archive -- may never have existed, may predate when "
-        "this room started being archived, or the archive may not yet have caught up to "
-        "this seq. Absence here is not proof the message never existed at all.",
-    }
+    return {"room": room, "seq": seq, "found": False, "text_matches": None, **_absence(seq, prev_seq, next_seq)}
 
 
 # Both this and kibble/attestor-check below are synchronous, CPU/IO-bound scans
