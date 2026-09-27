@@ -1,0 +1,5 @@
+# Rooms to stop archiving at a set time: "<room> <ISO-8601 UTC>" per line.
+# Applied once by archive_api.py's watchdog (see _apply_retirements); the
+# archive stays fully readable. Re-registering a room archives it again.
+# close1: flop-labs close-call challenge ends 2026-10-04.
+close1 2026-10-04T12:00:00Z

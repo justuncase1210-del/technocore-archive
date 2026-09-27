@@ -51,6 +51,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
+import archive_store
 import close1_index
 import did_activity
 import ownership
@@ -238,9 +239,108 @@ def _resume_watchers() -> None:
     the watch-all process itself is running (relaunched here if it died --
     this function already runs at startup and on every watchdog tick)."""
     if ARCHIVE_DIR.exists():
+        retired = _retired_rooms()
         for path in ARCHIVE_DIR.glob("*.jsonl"):
-            _start_watcher(path.stem)
+            if path.stem not in retired:
+                _start_watcher(path.stem)
     _ensure_watch_all_running()
+
+
+# Rooms to stop archiving at a set time, one "<room> <ISO-8601 UTC>" per line
+# (e.g. "close1 2026-10-04T12:00:00Z" -- the close-call contest ends Oct 4).
+# Once due, the room comes out of rooms.txt and export_rooms.txt, watch-all
+# stops its thread and seals its live file, the compactor gzips it, and its
+# archive stays fully readable (search/export/verify, close1/account). Each
+# retirement is applied once and recorded in retire_done.txt, so a room
+# registered again afterwards (POST /api/v1/archive/register) is archived
+# again normally.
+RETIRE_FILE = Path("/config/workspace/retire_rooms.txt")
+RETIRE_DONE_FILE = Path("/config/workspace/retire_done.txt")
+
+
+def _read_lines(path: Path) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        return []
+
+
+def _retire_schedule() -> dict[str, datetime]:
+    out = {}
+    for ln in _read_lines(RETIRE_FILE):
+        parts = ln.split()
+        if len(parts) != 2 or not ROOM_RE.fullmatch(parts[0]):
+            continue
+        try:
+            at = datetime.fromisoformat(parts[1].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        out[parts[0]] = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+    return out
+
+
+def _retired_rooms() -> set[str]:
+    """Rooms whose retirement has been applied and that haven't been
+    registered again since (re-registering puts them back in rooms.txt)."""
+    done = {ln.split()[0] for ln in _read_lines(RETIRE_DONE_FILE)}
+    return done - set(_read_lines(ROOMS_FILE))
+
+
+def _remove_line(path: Path, room: str) -> None:
+    lines = _read_lines(path)
+    if room not in lines:
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(ln + "\n" for ln in lines if ln != room), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _apply_retirements(now: datetime | None = None) -> list[str]:
+    now = now or datetime.now(timezone.utc)
+    done = {ln.split()[0] for ln in _read_lines(RETIRE_DONE_FILE)}
+    applied = []
+    for room, at in _retire_schedule().items():
+        if room in done or now < at:
+            continue
+        try:
+            _remove_line(ROOMS_FILE, room)
+            _remove_line(EXPORT_ROOMS_FILE, room)
+            RETIRE_DONE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(RETIRE_DONE_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{room} {now.strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+        except OSError as e:
+            print(f"WARNING: couldn't retire {room}: {e}", file=sys.stderr, flush=True)
+            continue
+        print(f"retired room {room} (scheduled {at.isoformat()})", flush=True)
+        applied.append(room)
+    return applied
+
+
+def _launch_compactor() -> None:
+    """Gzip sealed archive segments (archive_store.py compact). Detached, like
+    the index builds; it holds its own lock, so an overlapping launch exits
+    straight away. Nothing to do on most ticks -- a segment is sealed each
+    time a room's live file passes archive_store.ROTATE_BYTES."""
+    seg_root = ARCHIVE_DIR / "segments"
+    if not seg_root.exists():
+        return
+    uv_bin = _resolve_uv()
+    script = Path(__file__).parent / "archive_store.py"
+    if uv_bin is None or not script.exists():
+        return
+    # Lowest CPU priority: gzip on the box's single vCPU must never slow the
+    # API or the watcher (the first pass over lobby's history takes a while).
+    nice = ["nice", "-n", "19"] if shutil.which("nice") else []
+    try:
+        subprocess.Popen(
+            nice + [uv_bin, "run", str(script), "compact", "--archive-dir", str(ARCHIVE_DIR)],
+            cwd=str(Path(__file__).parent),
+            stdout=_open_log(ARCHIVE_DIR / "compact.log"), stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError as e:
+        print(f"WARNING: couldn't launch the compactor: {e}", file=sys.stderr, flush=True)
 
 
 # How often the watchdog re-checks for a dead watcher subprocess. Without this,
@@ -378,7 +478,9 @@ async def _watchdog_loop() -> None:
     global _watchdog_tick_count
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        _apply_retirements()
         _resume_watchers()
+        _launch_compactor()
         _rebuild_did_activity_index_async()
         _rebuild_close1_index_async()
         await asyncio.to_thread(_rotate_logs)
@@ -736,15 +838,10 @@ def _archive_path(room: str) -> Path:
 
 
 def _iter_messages(path: Path):
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except ValueError:
-                continue
+    """Every message of the room archived at `path` (<room>.jsonl), oldest
+    first -- its sealed/compressed segments, then the live file (see
+    archive_store.py)."""
+    yield from archive_store.iter_messages(path.parent, path.stem)
 
 
 # Paid scans stop here and return what they have (flagged truncated) rather
@@ -759,15 +856,10 @@ class _ScanBudgetExceeded(Exception):
 
 
 def _iter_messages_from(path: Path, offset: int = 0):
-    """_iter_messages, starting at a byte offset (a line start recorded by the
-    activity index) instead of the top of the file."""
-    with open(path, "rb") as f:
-        f.seek(offset)
-        for raw in f:
-            try:
-                yield json.loads(raw)
-            except ValueError:
-                continue
+    """_iter_messages, starting at a logical byte offset (a line start recorded
+    by the activity index) instead of the top of the stream. Offsets survive
+    rotation and compression unchanged."""
+    yield from archive_store.iter_messages(path.parent, path.stem, offset)
 
 
 def _index_offset(room: str, seq: int) -> int:
@@ -828,23 +920,9 @@ def _messages_after(room: str, path: Path, since: int, deadline: float | None = 
             return
 
 
-def _iter_lines_reverse(path: Path, block: int = 1 << 20):
-    """Raw lines from the end of the file backwards."""
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        pos = f.tell()
-        tail = b""
-        while pos > 0:
-            step = min(block, pos)
-            pos -= step
-            f.seek(pos)
-            parts = (f.read(step) + tail).split(b"\n")
-            tail = parts[0]  # may continue into the previous block
-            for line in reversed(parts[1:]):
-                if line:
-                    yield line
-        if tail:
-            yield tail
+def _iter_lines_reverse(path: Path):
+    """Raw lines from the newest backwards, across the live file and segments."""
+    yield from archive_store.iter_lines_reverse(path.parent, path.stem)
 
 
 ATTEST_RE = re.compile(r"^ATTEST\s+v1\s*\|\s*(\S+)\s*\|\s*(useful|not)\s*\|\s*(.*)$", re.IGNORECASE | re.DOTALL)
@@ -947,14 +1025,15 @@ def _new_room_agg() -> dict:
             "total_len": 0, "first_ts": None, "last_ts": None, "first_seq": None, "last_seq": None}
 
 
-def _advance_room_agg(agg: dict, path: Path) -> None:
-    if path.stat().st_size < agg["offset"]:  # file replaced/shrunk -- start this room over
-        agg.clear()
-        agg.update(_new_room_agg())
-    offset = agg["offset"]
-    with open(path, "rb") as f:
-        f.seek(offset)
-        for raw in f:
+def _advance_room_agg(agg: dict, path: Path) -> int:
+    """Returns the room's logical size (uncompressed bytes, all segments)."""
+    with archive_store.Snapshot(path.parent, path.stem) as snap:
+        size = snap.logical_size
+        if size < agg["offset"]:  # archive replaced/shrunk -- start this room over
+            agg.clear()
+            agg.update(_new_room_agg())
+        offset = agg["offset"]
+        for _pos, raw in snap.iter_lines(offset):
             if not raw.endswith(b"\n"):
                 break  # the live watcher's partial trailing write -- counted next pass
             offset += len(raw)
@@ -980,6 +1059,7 @@ def _advance_room_agg(agg: dict, path: Path) -> None:
                 agg["first_seq"] = seq
             agg["last_seq"] = seq
     agg["offset"] = offset
+    return size
 
 
 def _refresh_room_and_stats_caches() -> None:
@@ -995,13 +1075,15 @@ def _refresh_room_and_stats_caches() -> None:
             for path in sorted(ARCHIVE_DIR.glob("*.jsonl")):
                 agg = _room_aggs.setdefault(path.stem, _new_room_agg())
                 try:
-                    _advance_room_agg(agg, path)
-                    size = path.stat().st_size
-                except OSError:
+                    size = _advance_room_agg(agg, path)
+                    stored = archive_store.stored_bytes(ARCHIVE_DIR, path.stem)
+                except (OSError, RuntimeError):
                     continue
                 n = agg["count"]
+                # bytes: the archive's uncompressed size; stored_bytes: what it
+                # takes on disk now that sealed history is gzipped.
                 rooms_out.append({"room": path.stem, "archived_messages": n, "first_seq": agg["first_seq"],
-                                  "last_seq": agg["last_seq"], "bytes": size})
+                                  "last_seq": agg["last_seq"], "bytes": size, "stored_bytes": stored})
                 entry = {
                     "room": path.stem,
                     "archived_messages": n,
@@ -1771,7 +1853,7 @@ def stats(room: str | None = None):
         # Aggregate not warm yet (first minutes after a restart): a lazy scan is
         # fine for a small room, but on a multi-GB one it runs past the gateway
         # timeout and ties up the box's single vCPU for minutes.
-        if path.stat().st_size > LAZY_ROOM_STATS_MAX_BYTES:
+        if archive_store.logical_size(ARCHIVE_DIR, room) > LAZY_ROOM_STATS_MAX_BYTES:
             return {"room": room, "rooms": [], "warming_up": True}
         return _cached(f"stats:{room}", lambda: _room_stats(path))
     hit = _endpoint_cache.get("stats:_all_")

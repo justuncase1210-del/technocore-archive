@@ -58,6 +58,13 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+try:  # segment rotation (archive_store.py, same directory). Absent when this
+    # file is used on its own as a plain CLI client -- archives then just grow.
+    import archive_store
+except ImportError:
+    archive_store = None
 from datetime import datetime
 
 from nacl.signing import SigningKey, VerifyKey
@@ -280,7 +287,7 @@ def _last_archived_seq(out_path: str) -> int:
             f.seek(0, 2)
             size = f.tell()
             if size == 0:
-                return 0
+                return _sealed_last_seq(out_path)
             # Read backwards in chunks to find the last newline without loading a
             # potentially huge archive file fully into memory.
             chunk = 4096
@@ -294,9 +301,36 @@ def _last_archived_seq(out_path: str) -> int:
             last_line = data.strip(b"\n").split(b"\n")[-1]
             return json.loads(last_line)["seq"]
     except FileNotFoundError:
-        return 0
+        return _sealed_last_seq(out_path)
     except (ValueError, KeyError, OSError):
         return 0
+
+
+def _split_out(out_path: str):
+    p = Path(out_path)
+    return p.parent, p.name[: -len(".jsonl")] if p.name.endswith(".jsonl") else p.stem
+
+
+def _sealed_last_seq(out_path: str) -> int:
+    """The live file is empty or missing: if it was just rotated, the
+    newest seq is in the segment manifest."""
+    if archive_store is None:
+        return 0
+    d, room = _split_out(out_path)
+    return archive_store.load_manifest(d, room)["last_seq"] or 0
+
+
+def _maybe_rotate(out_path: str, threshold: int | None = None) -> None:
+    """Seal the live file into a segment once it's large (the compactor
+    gzips sealed segments later). Call with no handle open on out_path."""
+    if archive_store is None:
+        return
+    d, room = _split_out(out_path)
+    try:
+        if archive_store.rotate_if_large(d, room, threshold):
+            print(f"[{room}] rotated live file into a sealed segment", flush=True)
+    except (OSError, RuntimeError) as e:
+        print(f"[{room}] rotation failed (will retry): {e}", file=sys.stderr, flush=True)
 
 
 def cmd_watch(args):
@@ -403,50 +437,54 @@ def _watch_room_loop(room: str, out: str, wait: int, stop_event: threading.Event
     seq = resume_from
     written = 0
     last_poll = time.monotonic()
-    with open(out, "a", encoding="utf-8") as f:
-        while not stop_event.is_set():
-            qs = urllib.parse.urlencode(
-                {"since": seq, "wait": wait, "limit": 200, "format": "json"}
-            )
-            status, body = http_get(f"/r/{path_segment(room)}?{qs}")
-            if stop_event.is_set():
-                break
-            if status != 200:
-                print(f"[{room}] HTTP {status}: {body}", file=sys.stderr)
-                backoff = 65 + random.uniform(0, 10) if status == 429 else 5
-                stop_event.wait(backoff)
-                continue
-            try:
-                data = json.loads(body)
-            except ValueError:
-                print(f"[{room}] non-JSON response, skipping: {body[:200]!r}", file=sys.stderr)
-                stop_event.wait(5)
-                continue
-            new = sorted((m for m in data.get("messages", []) if m["seq"] > seq), key=lambda m: m["seq"])
-            if new and seq and new[0]["seq"] > seq + 1:
-                # More than a page arrived since the last poll: this reply skipped
-                # some. The ring still holds them unless they're already evicted.
-                _st, ring = _fetch_export(room)
-                if ring is not None:
-                    merged = {m["seq"]: m for m in ring if m["seq"] > seq}
-                    merged.update({m["seq"]: m for m in new})
-                    new = [merged[k] for k in sorted(merged)]
-            for msg in new:
-                if seq and msg["seq"] > seq + 1:
-                    _record_gap(room, out, seq + 1, msg["seq"] - 1)
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-                seq = msg["seq"]
-                written += 1
-            now = time.monotonic()
-            elapsed, last_poll = now - last_poll, now
-            if new:
-                f.flush()
-                print(f"[{room}] +{len(new)} (total {written}), at seq {seq}", flush=True)
-                rate = len(new) / max(elapsed, 1.0)
-                pause = max(2.0, min(IDLE_SLEEP, TARGET_PER_POLL / rate - wait))
-            else:
-                pause = IDLE_SLEEP
-            stop_event.wait(pause)
+    while not stop_event.is_set():
+        qs = urllib.parse.urlencode(
+            {"since": seq, "wait": wait, "limit": 200, "format": "json"}
+        )
+        status, body = http_get(f"/r/{path_segment(room)}?{qs}")
+        if stop_event.is_set():
+            break
+        if status != 200:
+            print(f"[{room}] HTTP {status}: {body}", file=sys.stderr)
+            backoff = 65 + random.uniform(0, 10) if status == 429 else 5
+            stop_event.wait(backoff)
+            continue
+        try:
+            data = json.loads(body)
+        except ValueError:
+            print(f"[{room}] non-JSON response, skipping: {body[:200]!r}", file=sys.stderr)
+            stop_event.wait(5)
+            continue
+        new = sorted((m for m in data.get("messages", []) if m["seq"] > seq), key=lambda m: m["seq"])
+        if new and seq and new[0]["seq"] > seq + 1:
+            # More than a page arrived since the last poll: this reply skipped
+            # some. The ring still holds them unless they're already evicted.
+            _st, ring = _fetch_export(room)
+            if ring is not None:
+                merged = {m["seq"]: m for m in ring if m["seq"] > seq}
+                merged.update({m["seq"]: m for m in new})
+                new = [merged[k] for k in sorted(merged)]
+        if new:
+            # Opened per batch, not held for the thread's lifetime, so a
+            # rotation below never leaves this thread appending to a sealed
+            # segment through an old handle.
+            with open(out, "a", encoding="utf-8") as f:
+                for msg in new:
+                    if seq and msg["seq"] > seq + 1:
+                        _record_gap(room, out, seq + 1, msg["seq"] - 1)
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    seq = msg["seq"]
+                    written += 1
+            _maybe_rotate(out)
+        now = time.monotonic()
+        elapsed, last_poll = now - last_poll, now
+        if new:
+            print(f"[{room}] +{len(new)} (total {written}), at seq {seq}", flush=True)
+            rate = len(new) / max(elapsed, 1.0)
+            pause = max(2.0, min(IDLE_SLEEP, TARGET_PER_POLL / rate - wait))
+        else:
+            pause = IDLE_SLEEP
+        stop_event.wait(pause)
     print(f"[{room}] stopped. {written} messages archived this run, last seq {seq}", flush=True)
 
 
@@ -483,6 +521,7 @@ def _export_room_loop(room: str, out: str, interval: int, stop_event: threading.
                     f.write(json.dumps(m, ensure_ascii=False) + "\n")
                     last = m["seq"]
             print(f"[{room}] export +{len(new)}, at seq {last}", flush=True)
+            _maybe_rotate(out)
         # Next fetch at a third of the ring's actual time span (how long the room
         # currently retains), so a burst of traffic that shrinks the ring also
         # shortens the interval -- bounded to [60s, interval].
@@ -518,9 +557,13 @@ def cmd_watch_all(args):
 
     stop_event = threading.Event()
 
+    room_stops: dict[str, threading.Event] = {}
+
     def _shutdown(signum, frame):
         print(f"\nreceived signal {signum}, stopping all room threads...", flush=True)
         stop_event.set()
+        for ev in list(room_stops.values()):
+            ev.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -552,10 +595,11 @@ def cmd_watch_all(args):
     def _start_room(room: str) -> None:
         check_name("room", room)
         out = f"{out_dir}/{room}.jsonl"
+        ev = room_stops[room] = threading.Event()  # per room, so one can be retired alone
         if room in _read_export_rooms():
-            target, targs = _export_room_loop, (room, out, export_interval, stop_event)
+            target, targs = _export_room_loop, (room, out, export_interval, ev)
         else:
-            target, targs = _watch_room_loop, (room, out, wait, stop_event)
+            target, targs = _watch_room_loop, (room, out, wait, ev)
         t = threading.Thread(target=target, args=targs, name=f"watch-{room}", daemon=True)
         threads[room] = t
         t.start()
@@ -570,7 +614,21 @@ def cmd_watch_all(args):
 
     while not stop_event.is_set():
         stop_event.wait(rescan)
-        for room in _read_rooms():
+        if stop_event.is_set():
+            break
+        listed = _read_rooms()
+        # A room taken out of the rooms file (retired -- see archive_api's
+        # retire_rooms.txt) stops here, and its live file is sealed so the
+        # compactor can gzip all of it. An empty list is treated as a read
+        # problem, never as "stop everything".
+        for room in [r for r in threads if listed and r not in listed]:
+            room_stops[room].set()
+            threads[room].join(timeout=30)
+            if not threads[room].is_alive():
+                _maybe_rotate(f"{out_dir}/{room}.jsonl", threshold=1)
+                print(f"[{room}] no longer listed: stopped and sealed", flush=True)
+                del threads[room], room_stops[room]
+        for room in listed:
             if room not in threads or not threads[room].is_alive():
                 if room in threads:
                     print(f"[{room}] thread died, restarting", file=sys.stderr)

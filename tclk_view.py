@@ -14,6 +14,8 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
+import archive_store
+
 ARCHIVE_DIR = Path(__file__).parent / "archives"
 TCLK_OFFERS_PATH = ARCHIVE_DIR / "tclk-offers.jsonl"
 
@@ -30,31 +32,24 @@ def _parse_frames() -> tuple[list[dict], list[dict], int]:
     other = 0
     if not TCLK_OFFERS_PATH.exists():
         return offers, accepts, other
-    with open(TCLK_OFFERS_PATH, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            text = msg.get("text", "")
-            if not text.startswith("tclk1 "):
-                continue
-            try:
-                frame = json.loads(text[len("tclk1 "):])
-            except ValueError:
-                continue
-            frame["_seq"] = msg.get("seq")
-            frame["_ts"] = msg.get("ts")
-            ftype = frame.get("type")
-            if ftype == "offer":
-                offers.append(frame)
-            elif ftype == "accept":
-                accepts.append(frame)
-            else:
-                other += 1
+    # segments + live file (archive_store.py), not just the live file
+    for msg in archive_store.iter_messages(TCLK_OFFERS_PATH.parent, TCLK_OFFERS_PATH.stem):
+        text = msg.get("text", "")
+        if not text.startswith("tclk1 "):
+            continue
+        try:
+            frame = json.loads(text[len("tclk1 "):])
+        except ValueError:
+            continue
+        frame["_seq"] = msg.get("seq")
+        frame["_ts"] = msg.get("ts")
+        ftype = frame.get("type")
+        if ftype == "offer":
+            offers.append(frame)
+        elif ftype == "accept":
+            accepts.append(frame)
+        else:
+            other += 1
     return offers, accepts, other
 
 

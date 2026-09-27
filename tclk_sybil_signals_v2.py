@@ -31,8 +31,21 @@ try:
 except ImportError:
     resource = None
 
+try:
+    import archive_store  # same directory; absent if this file is run on its own
+except ImportError:
+    archive_store = None
+
 
 def iter_jsonl(path):
+    # A room archive (archives/<room>.jsonl) may have sealed/compressed
+    # segments beside it -- read the whole logical stream, not just the live file.
+    if archive_store is not None and str(path).endswith(".jsonl"):
+        from pathlib import Path
+        p = Path(path)
+        if (p.parent / "segments" / p.stem).is_dir():
+            yield from archive_store.iter_messages(p.parent, p.stem)
+            return
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()

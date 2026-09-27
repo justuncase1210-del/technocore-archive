@@ -28,6 +28,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import archive_store
+
 REFEREE = "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte"
 SEASON = "close-1"
 TRADE_ROOM = "close1"
@@ -161,8 +163,15 @@ def _apply_referee_room(c, room: str, msg: dict) -> None:
 
 
 def _process(c, room: str, path: Path, start: int, progress_key: str | None = None) -> int:
+    # Logical offsets (archive_store.py): stable across rotation/compression.
+    # A backfill file has no segments, so it reads as the plain file it is.
+    with archive_store.Snapshot(path.parent, path.stem) as snap:
+        return _process_snap(c, room, snap, start, progress_key)
+
+
+def _process_snap(c, room: str, snap, start: int, progress_key: str | None = None) -> int:
     progress_key = progress_key or room
-    size = path.stat().st_size
+    size = snap.logical_size
     if size < start:
         raise _NeedsFullRebuild(progress_key)
     if size == start:
@@ -179,37 +188,35 @@ def _process(c, room: str, path: Path, start: int, progress_key: str | None = No
             c.execute("INSERT OR REPLACE INTO meta VALUES ('close1_prev_seq', ?)", (str(prev_seq),))
         c.commit()
 
-    with open(path, "rb") as f:
-        f.seek(start)
-        for raw in f:
-            if not raw.endswith(b"\n"):
-                break  # the live watcher's partial trailing write
-            offset += len(raw)
-            try:
-                msg = json.loads(raw)
-            except ValueError:
-                continue
-            if last is None:
-                c.execute("INSERT OR IGNORE INTO coverage(room, first_seq, first_ts) VALUES (?,?,?)",
-                          (room, msg.get("seq"), msg.get("ts")))
-            last = msg
-            if room == TRADE_ROOM:
-                seq = msg.get("seq")
-                if isinstance(seq, int):
-                    # Seqs are contiguous within a room, so any jump is messages
-                    # this archive doesn't have -- computed from what's actually
-                    # on disk, not from the watcher's own report.
-                    if prev_seq is not None and seq > prev_seq + 1:
-                        c.execute("INSERT OR IGNORE INTO gaps VALUES (?,?)", (prev_seq + 1, seq - 1))
-                    prev_seq = seq if prev_seq is None else max(prev_seq, seq)
-                _apply_trade_room(c, msg)
-            else:
-                _apply_referee_room(c, room, msg)
-            added += 1
-            pending += 1
-            if pending >= FLUSH_EVERY:
-                checkpoint()
-                pending = 0
+    for _pos, raw in snap.iter_lines(start):
+        if not raw.endswith(b"\n"):
+            break  # the live watcher's partial trailing write
+        offset += len(raw)
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        if last is None:
+            c.execute("INSERT OR IGNORE INTO coverage(room, first_seq, first_ts) VALUES (?,?,?)",
+                      (room, msg.get("seq"), msg.get("ts")))
+        last = msg
+        if room == TRADE_ROOM:
+            seq = msg.get("seq")
+            if isinstance(seq, int):
+                # Seqs are contiguous within a room, so any jump is messages
+                # this archive doesn't have -- computed from what's actually
+                # on disk, not from the watcher's own report.
+                if prev_seq is not None and seq > prev_seq + 1:
+                    c.execute("INSERT OR IGNORE INTO gaps VALUES (?,?)", (prev_seq + 1, seq - 1))
+                prev_seq = seq if prev_seq is None else max(prev_seq, seq)
+            _apply_trade_room(c, msg)
+        else:
+            _apply_referee_room(c, room, msg)
+        added += 1
+        pending += 1
+        if pending >= FLUSH_EVERY:
+            checkpoint()
+            pending = 0
     if last is not None:
         checkpoint()
     else:

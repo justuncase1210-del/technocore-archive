@@ -30,6 +30,8 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import archive_store
+
 FP_CAP = 16              # distinct text fingerprints tracked per DID
 SAMPLE_CHARS = 120       # example text stored per repeated fingerprint
 CHECKPOINT_EVERY = 5000  # lines between seq->byte-offset checkpoints
@@ -406,7 +408,14 @@ class _Builder:
 
 
 def _process_room(b: _Builder, room: str, path: Path, start: int) -> int:
-    size = path.stat().st_size
+    # Offsets are logical (archive_store.py): positions in the room's whole
+    # uncompressed stream, segments then live file, unchanged by rotation.
+    with archive_store.Snapshot(path.parent, room) as snap:
+        return _process_room_snap(b, room, snap, start)
+
+
+def _process_room_snap(b: _Builder, room: str, snap, start: int) -> int:
+    size = snap.logical_size
     if size < start:
         raise _NeedsFullRebuild(room)
     if size == start:
@@ -416,33 +425,31 @@ def _process_room(b: _Builder, room: str, path: Path, start: int) -> int:
     offset = start
     since_ckpt = CHECKPOINT_EVERY  # checkpoint the first line of every run
     last_seq = None
-    with open(path, "rb") as f:
-        f.seek(start)
-        for raw in f:
-            if not raw.endswith(b"\n"):
-                break  # the live watcher's partial trailing write -- next run picks it up
-            line_start = offset
-            offset += len(raw)
-            s = raw.strip()
-            if not s:
-                continue
-            try:
-                msg = json.loads(s)
-            except ValueError:
-                continue
-            seq = msg.get("seq")
-            if isinstance(seq, int):
-                last_seq = seq
-                if since_ckpt >= CHECKPOINT_EVERY:
-                    b.offsets.append((room_id, seq, line_start))
-                    since_ckpt = 0
-                since_ckpt += 1
-            b.add(room_id, msg)
-            added += 1
-            pending += 1
-            if pending >= FLUSH_EVERY:
-                b.flush(room, offset, last_seq)
-                pending = 0
+    for _pos, raw in snap.iter_lines(start):
+        if not raw.endswith(b"\n"):
+            break  # the live watcher's partial trailing write -- next run picks it up
+        line_start = offset
+        offset += len(raw)
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            msg = json.loads(s)
+        except ValueError:
+            continue
+        seq = msg.get("seq")
+        if isinstance(seq, int):
+            last_seq = seq
+            if since_ckpt >= CHECKPOINT_EVERY:
+                b.offsets.append((room_id, seq, line_start))
+                since_ckpt = 0
+            since_ckpt += 1
+        b.add(room_id, msg)
+        added += 1
+        pending += 1
+        if pending >= FLUSH_EVERY:
+            b.flush(room, offset, last_seq)
+            pending = 0
     b.flush(room, offset, last_seq)
     return added
 
@@ -751,12 +758,12 @@ def find_offset(conn, room: str, seq: int) -> int:
 
 def read_range(path: Path, start_offset: int, since_seq: int, limit: int) -> list[dict]:
     """Messages with seq > since_seq, reading forward from a checkpoint offset
-    instead of from the top of a multi-GB file."""
+    instead of from the top of a multi-GB archive (logical offset; see
+    archive_store.py)."""
     out: list[dict] = []
     skipped = 0
-    with open(path, "rb") as f:
-        f.seek(start_offset)
-        for raw in f:
+    with archive_store.Snapshot(path.parent, path.stem) as snap:
+        for _pos, raw in snap.iter_lines(start_offset):
             if not raw.endswith(b"\n"):
                 break
             try:
