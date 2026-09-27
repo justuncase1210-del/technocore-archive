@@ -51,6 +51,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
+import close1_index
 import did_activity
 import ownership
 import tclk_view
@@ -66,6 +67,7 @@ from x402.extensions.bazaar import OutputConfig, declare_discovery_extension, ba
 
 ARCHIVE_DIR = Path(os.getenv("ARCHIVE_DIR", Path(__file__).parent / "archives"))
 DID_INDEX_DB = Path(__file__).parent / "did_activity.db"
+CLOSE1_INDEX_DB = Path(__file__).parent / "close1_index.db"
 
 # /api/v1/archive/digest is only priced and registered when a key is present --
 # x402 settles before the handler runs, so advertising a digest route with no
@@ -287,21 +289,32 @@ def _rebuild_did_activity_index_async() -> None:
     the very first build -- or one after an archive file shrinks -- is a full
     pass. Detached for the same reason as the tclk rebuild above; the builder
     also holds its own file lock, so an overlapping launch just exits."""
+    _launch_index_build("did_activity.py", DID_INDEX_DB, "did-activity-index.log")
+
+
+def _rebuild_close1_index_async() -> None:
+    """Same incremental, detached pattern for the close-1 contest index. Skips
+    itself (inside the builder) when close1 isn't archived on this instance."""
+    if (ARCHIVE_DIR / "close1.jsonl").exists():
+        _launch_index_build("close1_index.py", CLOSE1_INDEX_DB, "close1-index.log")
+
+
+def _launch_index_build(script_name: str, db: Path, log_name: str) -> None:
     uv_bin = _resolve_uv()
-    script = Path(__file__).parent / "did_activity.py"
+    script = Path(__file__).parent / script_name
     if uv_bin is None or not script.exists():
         return
     try:
-        already = subprocess.run(["pgrep", "-f", "did_activity.py build"], capture_output=True, timeout=5)
+        already = subprocess.run(["pgrep", "-f", f"{script_name} build"], capture_output=True, timeout=5)
         if already.returncode == 0:
             return
     except (OSError, subprocess.SubprocessError):
         pass
     try:
         ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        log_file = open(ARCHIVE_DIR / "did-activity-index.log", "a")
+        log_file = open(ARCHIVE_DIR / log_name, "a")
         subprocess.Popen(
-            [uv_bin, "run", str(script), "build", "--archive-dir", str(ARCHIVE_DIR), "--db", str(DID_INDEX_DB)],
+            [uv_bin, "run", str(script), "build", "--archive-dir", str(ARCHIVE_DIR), "--db", str(db)],
             cwd=str(Path(__file__).parent),
             stdout=log_file, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
@@ -319,6 +332,7 @@ async def _watchdog_loop() -> None:
         await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
         _resume_watchers()
         _rebuild_did_activity_index_async()
+        _rebuild_close1_index_async()
         await asyncio.to_thread(_refresh_room_and_stats_caches)
         _watchdog_tick_count += 1
         if _watchdog_tick_count % TCLK_INDEX_REBUILD_EVERY_N_TICKS == 0:
@@ -556,6 +570,17 @@ routes: dict[str, RouteConfig] = {
         "that already existed before archiving started.",
         {"room": "lobby", "bucket": "day", "since": "2026-09-01", "until": "2026-09-15"},
     ),
+    "POST /api/v1/close1/account": _route(
+        "$0.01",
+        "Close Call (close-1) account check for an owner key, from this service's durable archive "
+        "of close1 and the referee's rooms -- past technocore.chat's ~12-minute close1 window: the "
+        "key's signed registration, whether its mint is listed or inferable, its offers and trades "
+        "with what the referee's flow posts say became of each id, and its latest board rank. "
+        "Covers close1 only (not other registered trading rooms), and flow posts omit part of every "
+        "busy sweep, so an unlisted trade isn't proof it was void. Every record carries its close1 "
+        "seq for independent verification.",
+        {"did": "did:key:..."},
+    ),
 }
 
 if DIGEST_LLM_API_KEY:
@@ -579,24 +604,28 @@ _DID_INDEX_PATHS = {
 }
 
 
+_CLOSE1_PATHS = {"/api/v1/close1/account"}
+
 _index_ready_state = {"value": False, "checked": 0.0}
+_close1_ready_state = {"value": False, "checked": 0.0}
 _INDEX_READY_TTL_WHEN_READY = 60.0
 _INDEX_READY_TTL_WHEN_NOT = 15.0
 
 
-async def _index_ready() -> bool:
+async def _index_ready(st: dict | None = None, check=None, db: Path | None = None) -> bool:
     """Cached, and checked in a thread: this runs in middleware on the event
     loop, and a synchronous SQLite open there -- against a database the
     builder is writing hard, with a multi-second busy timeout -- can stall
     every request the app is serving, /health included. A read that fails
     (busy) keeps the last known answer instead of flipping it."""
-    st = _index_ready_state
+    if st is None:
+        st, check, db = _index_ready_state, did_activity.is_ready, DID_INDEX_DB
     ttl = _INDEX_READY_TTL_WHEN_READY if st["value"] else _INDEX_READY_TTL_WHEN_NOT
     now = time.monotonic()
     if now - st["checked"] < ttl:
         return st["value"]
     st["checked"] = now  # before the await, so a burst of requests triggers one check, not many
-    result = await asyncio.to_thread(did_activity.is_ready, DID_INDEX_DB, 2.0)
+    result = await asyncio.to_thread(check, db, 2.0)
     if result is not None:
         st["value"] = result
     return st["value"]
@@ -613,10 +642,16 @@ class _DidIndexReadyGuard:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if (scope["type"] == "http" and scope.get("path") in _DID_INDEX_PATHS
-                and not await _index_ready()):
+        path = scope.get("path") if scope["type"] == "http" else None
+        not_ready = None
+        if path in _DID_INDEX_PATHS and not await _index_ready():
+            not_ready = "the activity index"
+        elif path in _CLOSE1_PATHS and not await _index_ready(_close1_ready_state, close1_index.is_ready,
+                                                               CLOSE1_INDEX_DB):
+            not_ready = "the close-1 contest index"
+        if not_ready:
             body = json.dumps({
-                "detail": "the activity index is still being built -- try again in a few minutes. "
+                "detail": f"{not_ready} is still being built -- try again in a few minutes. "
                           "No payment was taken for this request.",
             }).encode()
             await send({"type": "http.response.start", "status": 503,
@@ -827,7 +862,11 @@ _room_aggs_lock = threading.Lock()
 
 
 def _new_room_agg() -> dict:
-    return {"offset": 0, "count": 0, "signed": 0, "unsigned": 0, "dids": set(), "nicks": set(),
+    # Distinct counts are exact up to 100k values per room, then HyperLogLog --
+    # exact sets over lobby's millions of senders (and close1's ~20 new keys a
+    # second) were an unbounded, multi-GB share of this process's memory.
+    return {"offset": 0, "count": 0, "signed": 0, "unsigned": 0,
+            "dids": did_activity.DistinctCounter(), "nicks": did_activity.DistinctCounter(),
             "total_len": 0, "first_ts": None, "last_ts": None, "first_seq": None, "last_seq": None}
 
 
@@ -886,19 +925,22 @@ def _refresh_room_and_stats_caches() -> None:
                 n = agg["count"]
                 rooms_out.append({"room": path.stem, "archived_messages": n, "first_seq": agg["first_seq"],
                                   "last_seq": agg["last_seq"], "bytes": size})
-                stats_out.append({
+                entry = {
                     "room": path.stem,
                     "archived_messages": n,
                     "signed_messages": agg["signed"],
                     "unsigned_messages": agg["unsigned"],
-                    "distinct_signers": len(agg["dids"]),
-                    "distinct_unsigned_nicks": len(agg["nicks"]),
+                    "distinct_signers": agg["dids"].count(),
+                    "distinct_unsigned_nicks": agg["nicks"].count(),
                     "avg_text_length": round(agg["total_len"] / n, 1) if n else 0,
                     "first_ts": agg["first_ts"],
                     "last_ts": agg["last_ts"],
                     "first_seq": agg["first_seq"],
                     "last_seq": agg["last_seq"],
-                })
+                }
+                if agg["dids"].estimated or agg["nicks"].estimated:
+                    entry["distinct_counts_estimated"] = True  # HyperLogLog, ~0.8% standard error
+                stats_out.append(entry)
         now = time.time()
         _endpoint_cache["rooms"] = (now, {"rooms": rooms_out})
         _endpoint_cache["stats:_all_"] = (now, {"rooms": stats_out})
@@ -1812,6 +1854,14 @@ def tclk_risk_check_request(did: str) -> dict:
     return _paid_request("POST /api/v1/tclk/risk-check", {"did": did})
 
 
+@mcp_server.tool()
+def close1_account_request(did: str) -> dict:
+    """Returns the exact HTTP request needed to check a Close Call (close-1)
+    owner key -- registration, mint, trades and their referee outcomes, board
+    rank -- via x402. This tool does NOT run it or move any payment itself."""
+    return _paid_request("POST /api/v1/close1/account", {"did": did})
+
+
 def archive_digest_request(room: str, since: int = 0, limit: int = 200) -> dict:
     """Returns the exact HTTP request needed to get an LLM-written digest of up
     to 300 archived messages after a seq in one room via x402 -- this tool does
@@ -2297,6 +2347,16 @@ def archive_digest(body: dict = None):
 
 if DIGEST_LLM_API_KEY:
     app.post("/api/v1/archive/digest")(archive_digest)
+
+
+@app.post("/api/v1/close1/account")
+def close1_account(body: dict = None):
+    did = _require_did(body or {})
+    conn = close1_index.connect_reader(CLOSE1_INDEX_DB)
+    try:
+        return close1_index.account(conn, did)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

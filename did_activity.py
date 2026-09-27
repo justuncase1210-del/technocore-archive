@@ -116,22 +116,67 @@ def parse_ts(ts):
     return dt.timestamp(), dt.strftime("%Y-%m-%dT%H:%M:%SZ"), dt.hour
 
 
-def _hll_add(reg: bytearray, h: int) -> None:
-    """h is a 63-bit fingerprint (uniform: sha1-derived)."""
-    rest_bits = 63 - HLL_P
+def _hll_add_p(reg: bytearray, h: int, p: int) -> None:
+    """h is a uniform 63-bit hash; reg has 2**p one-byte registers."""
+    rest_bits = 63 - p
     idx = h >> rest_bits
     rank = rest_bits - (h & ((1 << rest_bits) - 1)).bit_length() + 1
     if rank > reg[idx]:
         reg[idx] = rank
 
 
-def hll_count(reg) -> float:
-    alpha = 0.7213 / (1 + 1.079 / HLL_M)
-    est = alpha * HLL_M * HLL_M / sum(2.0 ** -r for r in reg)
+def _hll_count_regs(reg) -> float:
+    m = len(reg)
+    alpha = 0.7213 / (1 + 1.079 / m)
+    est = alpha * m * m / sum(2.0 ** -r for r in reg)
     zeros = reg.count(0)
-    if est <= 2.5 * HLL_M and zeros:
-        est = HLL_M * math.log(HLL_M / zeros)  # linear counting: exact-ish for small cardinalities
+    if est <= 2.5 * m and zeros:
+        est = m * math.log(m / zeros)  # linear counting: exact-ish for small cardinalities
     return est
+
+
+def _hll_add(reg: bytearray, h: int) -> None:
+    _hll_add_p(reg, h, HLL_P)
+
+
+def hll_count(reg) -> float:
+    return _hll_count_regs(reg)
+
+
+class DistinctCounter:
+    """Exact set of strings up to EXACT_MAX, then a HyperLogLog (2**P one-byte
+    registers; P=14 is 16KB at ~0.8% standard error). Keeps a distinct count
+    over millions of values in bounded memory -- close1 alone adds ~20 new
+    signed keys per second."""
+    EXACT_MAX = 100_000
+    P = 14
+    __slots__ = ("exact", "reg")
+
+    def __init__(self):
+        self.exact: set[str] | None = set()
+        self.reg: bytearray | None = None
+
+    @staticmethod
+    def _hash(s: str) -> int:
+        return int.from_bytes(hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "big") >> 1
+
+    def add(self, s: str) -> None:
+        if self.reg is not None:
+            _hll_add_p(self.reg, self._hash(s), self.P)
+            return
+        self.exact.add(s)
+        if len(self.exact) > self.EXACT_MAX:
+            self.reg = bytearray(1 << self.P)
+            for x in self.exact:
+                _hll_add_p(self.reg, self._hash(x), self.P)
+            self.exact = None
+
+    def count(self) -> int:
+        return len(self.exact) if self.reg is None else round(_hll_count_regs(self.reg))
+
+    @property
+    def estimated(self) -> bool:
+        return self.reg is not None
 
 
 def _hours_encode(hours: list[int]) -> str:

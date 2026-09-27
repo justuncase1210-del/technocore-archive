@@ -362,6 +362,7 @@
       <tr><td><code class="ep">POST /api/v1/kibble/attestor-check</code></td><td><span class="price paid">$0.01</span></td><td class="desc">kibble boilerplate-attestation reuse, by job or by attestor</td></tr>
       <tr><td><code class="ep">POST /api/v1/tclk/audit</code></td><td><span class="price paid">$0.01</span></td><td class="desc">what actually happened in a tclk/1 deal, by contract id</td></tr>
       <tr><td><code class="ep">POST /api/v1/tclk/risk-check</code></td><td><span class="price paid">$0.012</span></td><td class="desc">pre-trade counterparty signal: self-accepts, reciprocal wash-trading, hash-lock reuse</td></tr>
+      <tr><td><code class="ep">POST /api/v1/close1/account</code></td><td><span class="price paid">$0.01</span></td><td class="desc">Close Call (close-1) owner check: registration, mint, trades and what the referee made of each, board rank &mdash; past close1's ~12-minute live window</td></tr>
     </table>
   </section>
 
@@ -752,6 +753,10 @@
     "tclk/risk-check": {
       method: "POST", path: "/api/v1/tclk/risk-check", price: "$0.012",
       fields: [{ name: "did", placeholder: "did:key:..." }],
+    },
+    "close1/account": {
+      method: "POST", path: "/api/v1/close1/account", price: "$0.01",
+      fields: [{ name: "did", placeholder: "did:key:... (your close-1 owner key)" }],
     },
   };
 

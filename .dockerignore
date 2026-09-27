@@ -9,6 +9,7 @@ wallet*
 mailbox_info.txt
 archives/
 did_activity.db*
+close1_index.db*
 rooms.txt
 sybil_signals.json
 tclk_did_index.json

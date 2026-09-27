@@ -10,3 +10,6 @@ mcp_publish/mcp-publisher.tar.gz
 did_activity.db
 did_activity.db-*
 did_activity.db.lock
+close1_index.db
+close1_index.db-*
+close1_index.db.lock
