@@ -159,10 +159,11 @@ def _apply_referee_room(c, room: str, msg: dict) -> None:
                        if isinstance(row, list) and len(row) >= 2 and isinstance(row[0], str)])
 
 
-def _process(c, room: str, path: Path, start: int) -> int:
+def _process(c, room: str, path: Path, start: int, progress_key: str | None = None) -> int:
+    progress_key = progress_key or room
     size = path.stat().st_size
     if size < start:
-        raise _NeedsFullRebuild(room)
+        raise _NeedsFullRebuild(progress_key)
     if size == start:
         return 0
     offset, pending, added = start, 0, 0
@@ -189,14 +190,28 @@ def _process(c, room: str, path: Path, start: int) -> int:
             pending += 1
             if pending >= FLUSH_EVERY:
                 _note_coverage(c, room, last.get("seq"), last.get("ts"))
-                c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (room, offset))
+                c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
                 c.commit()
                 pending = 0
     if last is not None:
         _note_coverage(c, room, last.get("seq"), last.get("ts"))
-    c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (room, offset))
+    c.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (progress_key, offset))
     c.commit()
     return added
+
+
+def _read_gaps(archive_dir: Path) -> list:
+    gaps = []
+    try:
+        with open(archive_dir / f"{TRADE_ROOM}.gaps", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    gaps.append(json.loads(line))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return gaps
 
 
 def _reset(c) -> None:
@@ -233,6 +248,15 @@ def build(archive_dir: Path, db_path: Path) -> dict:
             added = 0
             try:
                 for room in SOURCES:
+                    # Referee history from before live archiving began lives in a
+                    # separate backfill file (archives/backfill/, invisible to the
+                    # archive's own *.jsonl scans) -- read first, then the live file.
+                    # Prepending it into the live file instead would shift every byte
+                    # offset the incremental indexes have already recorded.
+                    backfill = archive_dir / "backfill" / f"{room}.jsonl"
+                    if room != TRADE_ROOM and backfill.exists():
+                        key = f"backfill/{room}"
+                        added += _process(conn, room, backfill, progress.get(key, 0), key)
                     path = archive_dir / f"{room}.jsonl"
                     if path.exists():
                         added += _process(conn, room, path, progress.get(room, 0))
@@ -241,7 +265,8 @@ def build(archive_dir: Path, db_path: Path) -> dict:
                 print(f"archive {e} shrank below its indexed offset -- full rebuild", flush=True)
                 _reset(conn)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [("generated_at", now), ("ready", "1")])
+        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                         [("generated_at", now), ("ready", "1"), ("close1_gaps", json.dumps(_read_gaps(archive_dir)))])
         conn.commit()
         return {"messages_indexed": added, "generated_at": now}
     finally:
@@ -321,9 +346,12 @@ def account(conn, did: str) -> dict:
         mint_info = {"status": "no_record", "reason": "no registration, trade or board entry for this key in the archive"}
 
     c1 = cov.get(TRADE_ROOM, {})
+    gaps = json.loads(meta.get("close1_gaps") or "[]")
     notes = [
         f"close1 archive starts at seq {c1.get('first_seq')} ({c1.get('first_ts')}); technocore.chat keeps only "
         "~12 minutes of close1, so earlier registrations and trades were already gone when archiving began.",
+        (f"close1 has {len(gaps)} recorded gap(s) -- seq ranges evicted before they could be archived; "
+         "see coverage.close1_gaps." if gaps else "No gaps recorded in the close1 archive since it began."),
         "Only close1 is archived: trades posted in other registered trading rooms aren't here.",
         "not_listed means no referee flow post names the trade id -- flow posts omit part of every busy "
         "sweep (see each sweep's 'omitted' counts), so it is not proof the trade was void.",
@@ -339,7 +367,8 @@ def account(conn, did: str) -> dict:
         "trades_total": len(rows),
         "trades_truncated": len(rows) > MAX_TRADES,
         "trades": trades,
-        "coverage": {r: {k: v for k, v in d.items() if k != "room"} for r, d in cov.items()},
+        "coverage": {**{r: {k: v for k, v in d.items() if k != "room"} for r, d in cov.items()},
+                     "close1_gaps": gaps[-50:]},
         "notes": notes,
     }
 

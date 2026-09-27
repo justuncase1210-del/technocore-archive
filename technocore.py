@@ -181,11 +181,11 @@ def whoami(key_path: str) -> None:
 
 # --------------------------------------------------------------- http --------
 
-def http_get(path: str) -> tuple[int, str]:
+def http_get(path: str, timeout: float = 15) -> tuple[int, str]:
     url = BASE_URL + path
     req = urllib.request.Request(url, headers={"User-Agent": "technocore-py/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", errors="replace")
@@ -382,6 +382,56 @@ def _watch_room_loop(room: str, out: str, wait: int, stop_event: threading.Event
     print(f"[{room}] stopped. {written} messages archived this run, last seq {seq}", flush=True)
 
 
+def _export_room_loop(room: str, out: str, interval: int, stop_event: threading.Event) -> None:
+    """Archive a very high-volume room by fetching its whole retained window
+    (GET /r/<room>/export) every `interval` seconds, instead of long-polling.
+
+    Long-polling returns at most 200 messages per request, so a room like
+    close1 (~28 messages/s) needs a request every few seconds just to keep
+    up -- confirmed live, that alone tripped technocore.chat's per-IP edge
+    limit (HTTP 429) for EVERY room this process archives. One export returns
+    the room's full retained window (~12 minutes for close1), so a fetch every
+    few minutes misses nothing while the window is longer than the interval.
+    If it isn't -- messages were evicted before a fetch reached them -- the
+    missing seq range is logged and recorded in <out minus .jsonl>.gaps, never
+    silently skipped."""
+    last = _last_archived_seq(out)
+    gaps_path = out[: -len(".jsonl")] + ".gaps"
+    print(f"[{room}] export-mode archiving -> {out} every {interval}s (resuming from seq {last})", flush=True)
+    while not stop_event.is_set():
+        status, body = http_get(f"/r/{path_segment(room)}/export", timeout=120)
+        if stop_event.is_set():
+            break
+        if status != 200:
+            print(f"[{room}] export HTTP {status}: {body[:200]}", file=sys.stderr, flush=True)
+            stop_event.wait(65 + random.uniform(0, 10) if status == 429 else 30)
+            continue
+        msgs = []
+        for line in body.splitlines():
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and isinstance(msg.get("seq"), int):
+                msgs.append(msg)
+        msgs.sort(key=lambda m: m["seq"])
+        if msgs and last and msgs[0]["seq"] > last + 1:
+            gap = {"from_seq": last + 1, "to_seq": msgs[0]["seq"] - 1,
+                   "detected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            print(f"[{room}] GAP: seq {gap['from_seq']}..{gap['to_seq']} was evicted before it could be "
+                  "archived", file=sys.stderr, flush=True)
+            with open(gaps_path, "a", encoding="utf-8") as g:
+                g.write(json.dumps(gap) + "\n")
+        new = [m for m in msgs if m["seq"] > last]
+        if new:
+            with open(out, "a", encoding="utf-8") as f:
+                for m in new:
+                    f.write(json.dumps(m, ensure_ascii=False) + "\n")
+            last = new[-1]["seq"]
+            print(f"[{room}] export +{len(new)}, at seq {last}", flush=True)
+        stop_event.wait(interval)
+
+
 def cmd_watch_all(args):
     """One process, one thread per room, instead of one OS process per room. Each
     thread is >99% idle (blocked on the long-poll GET), so per-room cost is a thread
@@ -427,13 +477,28 @@ def cmd_watch_all(args):
         except FileNotFoundError:
             return []
 
+    export_rooms_file = getattr(args, "export_rooms_file", None)
+    export_interval = getattr(args, "export_interval", 180)
+
+    def _read_export_rooms() -> set[str]:
+        # Read when a room's thread starts; switching a running room between
+        # modes takes a restart of this process.
+        if not export_rooms_file:
+            return set()
+        try:
+            with open(export_rooms_file, encoding="utf-8") as f:
+                return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        except FileNotFoundError:
+            return set()
+
     def _start_room(room: str) -> None:
         check_name("room", room)
         out = f"{out_dir}/{room}.jsonl"
-        t = threading.Thread(
-            target=_watch_room_loop, args=(room, out, wait, stop_event),
-            name=f"watch-{room}", daemon=True,
-        )
+        if room in _read_export_rooms():
+            target, targs = _export_room_loop, (room, out, export_interval, stop_event)
+        else:
+            target, targs = _watch_room_loop, (room, out, wait, stop_event)
+        t = threading.Thread(target=target, args=targs, name=f"watch-{room}", daemon=True)
         threads[room] = t
         t.start()
 
@@ -592,6 +657,10 @@ def main():
                     help="newline-separated room names, re-read every --rescan-seconds")
     sp.add_argument("--out-dir", required=True, help="directory for <room>.jsonl files")
     sp.add_argument("--wait", type=int, default=25, help="long-poll seconds per request")
+    sp.add_argument("--export-rooms-file", default=None,
+                    help="rooms to archive by periodic /export instead of long-polling (very high-volume rooms)")
+    sp.add_argument("--export-interval", type=int, default=180,
+                    help="seconds between exports for --export-rooms-file rooms")
     sp.add_argument("--rescan-seconds", type=int, default=30,
                     help="how often to re-read --rooms-file for new/removed rooms")
     sp.set_defaults(func=cmd_watch_all)

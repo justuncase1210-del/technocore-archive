@@ -131,6 +131,9 @@ def _warn_uv_missing_once() -> None:
 
 WATCHED: dict[str, subprocess.Popen] = {}
 ROOMS_FILE = Path("/config/workspace/rooms.txt")
+# Rooms (also listed in rooms.txt) archived by periodic /export instead of
+# long-polling -- see technocore.py _export_room_loop for why close1 needs it.
+EXPORT_ROOMS_FILE = Path("/config/workspace/export_rooms.txt")
 
 
 def _read_watched_rooms() -> list[str]:
@@ -215,6 +218,7 @@ def _ensure_watch_all_running() -> None:
         [
             uv_bin, "run", str(TECHNOCORE_SCRIPT), "watch-all",
             "--rooms-file", str(ROOMS_FILE),
+            "--export-rooms-file", str(EXPORT_ROOMS_FILE),
             "--out-dir", str(ARCHIVE_DIR),
             "--wait", "25", "--rescan-seconds", "30",
         ],
