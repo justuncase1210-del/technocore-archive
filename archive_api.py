@@ -1107,6 +1107,12 @@ def _refresh_room_and_stats_caches() -> None:
         pass  # never let a bad pass kill the watchdog loop that calls this
     finally:
         _room_aggs_lock.release()
+    # Free /api/v1/tclk/stats: same incremental, off-request-path pattern,
+    # run after the room pass rather than alongside it on the single vCPU.
+    try:
+        tclk_view.refresh()
+    except Exception:
+        pass
 
 
 @app.get("/rooms")
