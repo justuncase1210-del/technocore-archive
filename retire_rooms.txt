@@ -3,3 +3,9 @@
 # archive stays fully readable. Re-registering a room archives it again.
 # close1: flop-labs close-call challenge ends 2026-10-04.
 close1 2026-10-04T12:00:00Z
+# Referee rooms: kept 3 days past the lock to catch final sweep/settlement posts.
+d-close1-flow 2026-10-07T12:00:00Z
+d-close1-state 2026-10-07T12:00:00Z
+d-close1-pnl 2026-10-07T12:00:00Z
+d-close1-positions 2026-10-07T12:00:00Z
+d-close1-price 2026-10-07T12:00:00Z
