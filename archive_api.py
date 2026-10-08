@@ -815,6 +815,77 @@ class _DidIndexReadyGuard:
 
 app.add_middleware(_DidIndexReadyGuard)
 
+
+# Private record of every settled sale, one JSON line each: time, endpoint,
+# price, payer, tx hash. The chain shows amount and payer but not which
+# endpoint was bought, and this wallet also receives the Vercel server's
+# payments, so price-matching on-chain transfers can't tell sales apart.
+# Never served by any route. `uv run sales_report.py` summarizes it.
+SALES_LOG = ARCHIVE_DIR / "sales.jsonl"
+_PRICES = {key: cfg.accepts[0].price for key, cfg in routes.items()}
+
+
+def _decode_settlement(value: bytes):
+    import base64
+    try:
+        d = json.loads(base64.b64decode(value + b"=" * (-len(value) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _record_sale(route: str, status: int, settle: dict) -> None:
+    amount = settle.get("amount")
+    entry = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endpoint": route,
+        "price": _PRICES.get(route),
+        "amount_usdc": int(amount) / 1e6 if str(amount or "").isdigit() else None,
+        "payer": settle.get("payer"),
+        "tx": settle.get("transaction"),
+        "network": settle.get("network"),
+        "status": status,
+    }
+    try:
+        with open(SALES_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        print(f"WARNING: couldn't write the sales log: {e}", file=sys.stderr, flush=True)
+
+
+class _SalesLog:
+    """Outermost middleware: watches each priced route's response for the
+    x402 settlement header and logs successful settlements. It only reads
+    headers on the way out -- never changes the request, the response or the
+    payment flow, and a logging failure can't affect the caller."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        route = f"{scope.get('method')} {scope.get('path')}" if scope["type"] == "http" else None
+        if route not in _PRICES:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                try:
+                    for k, v in message.get("headers", []):
+                        if k.lower() in (b"payment-response", b"x-payment-response"):
+                            settle = _decode_settlement(v)
+                            if settle and settle.get("success"):
+                                _record_sale(route, message.get("status"), settle)
+                            break
+                except Exception as e:  # logging must never break a paid response
+                    print(f"WARNING: sales log: {e}", file=sys.stderr, flush=True)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(_SalesLog)
+
 # ownership.py: free reads + the free launch-promo claim go on the router (never
 # payment-gated); the two real paid actions (claim, allow) are registered directly
 # on `app` at the exact paths the `routes` dict above already prices.
